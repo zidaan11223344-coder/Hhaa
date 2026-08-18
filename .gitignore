@@ -1,0 +1,9 @@
+youtube_cookies.txt
+tiktok_cookies.txt
+spotify_cookies.txt
+*.cookies
+.env
+logs/
+generated_music/
+generated_gifts/
+published_media/
