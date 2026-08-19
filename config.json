@@ -31,5 +31,8 @@
   "publish_public_base_url": "",
   "game_bucket": "bot-games",
   "music_direct_link_fallback": true,
-  "music_direct_link_text": "▶️ تشغيل الرابط"
+  "music_direct_link_text": "▶️ تشغيل الرابط",
+  "game_storage": "supabase",
+  "game_local_dir": "generated_games",
+  "social_webhook_token": ""
 }
