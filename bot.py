@@ -210,10 +210,10 @@ def yt_base_options(source_label="YouTube"):
     if source_label == "YouTube":
         # YouTube في 2026 يفرض PO Tokens على بعض عملاء GVS.
         # لا نستخدم mweb افتراضياً لأنه أكثر عرضة لـ403 بدون PO Token.
-        clients = str(os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "default,web_embedded")).strip()
+        clients = str(os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "default,web_embedded,tv,tvos")).strip()
         client_list = [x.strip() for x in clients.split(",") if x.strip()]
         if not client_list:
-            client_list = ["default", "web_embedded"]
+            client_list = ["default", "web_embedded", "tv", "tvos"]
         if has_youtube_cookies():
             options["cookiefile"] = YOUTUBE_COOKIES_PATH
         ex = {"youtube": {"player_client": client_list}}
@@ -366,7 +366,9 @@ def save_moderation(x): save_json(MODERATION_PATH, x)
 def load_welcome(): return load_json(WELCOME_PATH, {})
 def save_welcome(x): save_json(WELCOME_PATH, x)
 def load_published_posts(): return load_json(PUBLISHED_POSTS_PATH, {})
-def save_published_posts(x): save_json(PUBLISHED_POSTS_PATH, x)
+def save_published_posts(x):
+    _prune_expired_posts(x)  # حذف المنشورات المنتهية (>10 ساعات) عند أي حفظ
+    save_json(PUBLISHED_POSTS_PATH, x)
 def load_social_events(): return load_json(SOCIAL_EVENTS_PATH, {})
 def save_social_events(x): save_json(SOCIAL_EVENTS_PATH, x)
 
@@ -496,24 +498,72 @@ def fmt_pts(n):
         s = str(n)
     return ("-" if neg else "") + s
 
+POST_TTL_SECONDS = int(C.get("post_ttl_hours", 10)) * 3600
+
+
+def _parse_post_time(created_at):
+    try:
+        s = str(created_at or "").replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _prune_expired_posts(posts):
+    """حذف المنشورات التي مضى على نشرها أكثر من POST_TTL_SECONDS (افتراضيًا 10 ساعات)."""
+    now = time.time()
+    removed = []
+    for pid in list(posts.keys()):
+        post = posts[pid]
+        if (now - _parse_post_time(post.get("created_at"))) > POST_TTL_SECONDS:
+            posts.pop(pid, None)
+            removed.append(pid)
+    # إزالة الأكواد المرتبطة بالمنشورات المحذوفة
+    for pid in removed:
+        for c in [code for code, p in _POST_CODES.items() if p == pid]:
+            _POST_CODES.pop(c, None)
+    return bool(removed)
+
+
 def _find_post_by_code(code):
-    """البحث عن منشور (أغنية/صورة) بالكود المختصر."""
+    """البحث عن منشور (أغنية/صورة/هدية) بالكود المختصر، مع حذف المنتهي تلقائيًا."""
     pid = _POST_CODES.get(code)
     if not pid:
         return None
     posts = load_published_posts()
+    _prune_expired_posts(posts)
+    save_published_posts(posts)
     return posts.get(pid)
 
-def _notify_post_owner(post, event_text):
-    """إرسال إشعار لصاحب المنشور في خاص البوت عند تفاعل معه."""
+
+def record_post_reaction(post, kind, p_name, extra=None):
+    """حفظ عداد التفاعل وسجل التفاعلات داخل المنشور ثم حفظ الملف."""
+    try:
+        post.setdefault("reactions", {})
+        cur = post["reactions"].get(kind, 0) or 0
+        post["reactions"][kind] = cur + 1
+        post.setdefault("interactions", [])
+        post["interactions"].append({"kind": kind, "user": p_name, "extra": extra, "at": now_iso()})
+        posts = load_published_posts()
+        pid = post.get("post_id")
+        if pid and pid in posts:
+            posts[pid] = post
+            save_published_posts(posts)
+    except Exception:
+        log.exception("record_post_reaction failed")
+
+
+async def _notify_post_owner(post, event_text, p_name, kind, extra=None):
+    """حفظ التفاعل ثم إرسال إشعار لصاحب المنشور في خاص البوت."""
     if not post:
         return None
+    record_post_reaction(post, kind, p_name, extra)
     owner_id = post.get("owner_id")
     owner_name = post.get("owner_name", "مجهول")
     if not owner_id:
         return None
     try:
-        asyncio.create_task(dm_send(owner_id, f"🔔 {event_text}\n📌 المنشور من: {post.get('source_room_id', 'الغرفة')} | {post.get('title', '')}"))
+        await dm_send(owner_id, f"🔔 {event_text}\n📌 المنشور: {post.get('title', '')}")
         return f"✅ تم إرسال التفاعل لصاحب المنشور @{owner_name}."
     except Exception:
         log.exception("post owner notify failed")
@@ -535,28 +585,28 @@ async def _handle_post_interaction(rid, text, uid, p_name):
     p_type = post.get("type", "")
     if kind.lower() == "like":
         note = "❤️ إعجاب" if p_type == "music" else "👍 إعجاب"
-        return await _notify_post_owner(post, f"{note} من @{p_name} على المنشور بالكود {code.upper()}."), False
+        return await _notify_post_owner(post, f"{note} من @{p_name} على المنشور بالكود {code.upper()}.", p_name, "like"), False
     if kind.lower() == "dislike":
-        return await _notify_post_owner(post, f"👎 عدم إعجاب من @{p_name} على المنشور بالكود {code.upper()}."), False
+        return await _notify_post_owner(post, f"👎 عدم إعجاب من @{p_name} على المنشور بالكود {code.upper()}.", p_name, "dislike"), False
     if kind.lower() in ("love", "loved"):
-        return await _notify_post_owner(post, f"💖 أحببته من @{p_name} على المنشور بالكود {code.upper()}."), False
+        return await _notify_post_owner(post, f"💖 أحببته من @{p_name} على المنشور بالكود {code.upper()}.", p_name, "love"), False
     if kind.lower() == "comment":
         if not extra:
             return "💬 اكتب التعليق بعد الأمر، مثال: Comment@KOD تعليقك هنا", False
         if len(extra) > 200:
             return "💬 التعليق طويل جدًا (حد 200 حرف).", False
-        return await _notify_post_owner(post, f"💬 تعليق من @{p_name}: {extra}"), False
+        return await _notify_post_owner(post, f"💬 تعليق من @{p_name}: {extra}", p_name, "comment", extra), False
     if kind.lower() == "msg":
         if not extra:
             return "✉️ اكتب رسالتك بعد الأمر، مثال: msg@KOD نص الرسالة", False
-        return await _notify_post_owner(post, f"✉️ رسالة من @{p_name}: {extra}"), False
+        return await _notify_post_owner(post, f"✉️ رسالة من @{p_name}: {extra}", p_name, "msg", extra), False
     if kind.lower() == "report":
         if not extra:
             return "🚨 اكتب سبب الإبلاغ بعد الأمر، مثال: report@KOD سبب الإبلاغ", False
         if len(extra) > 200:
             return "🚨 سبب الإبلاغ طويل جدًا (حد 200 حرف).", False
         # إبلاغ لصاحب المنشور وللماسترز
-        await _notify_post_owner(post, f"🚨 إبلاغ من @{p_name}: {extra}")
+        await _notify_post_owner(post, f"🚨 إبلاغ من @{p_name}: {extra}", p_name, "report", extra)
         try:
             masters = load_masters()
             for mid in masters[:5]:
@@ -711,16 +761,38 @@ def render_gift_image(gift, sender_name, receiver_name):
     to_y = int(float(C.get("gift_to_y", height * 0.88)))
     box_left = int(float(C.get("gift_box_left", width * 0.12)))
     box_right = int(float(C.get("gift_box_right", width * 0.88)))
+    # حدود كل مربع (FROM وTO) لتوسيط الاسم داخله أفقيًا ورأسيًا؛ يمكن ضبطها من config.json.
+    from_box = (
+        int(float(C.get("gift_from_box_left", box_left))),
+        int(float(C.get("gift_from_box_top", height * 0.745))),
+        int(float(C.get("gift_from_box_right", box_right))),
+        int(float(C.get("gift_from_box_bottom", height * 0.82))),
+    )
+    to_box = (
+        int(float(C.get("gift_to_box_left", box_left))),
+        int(float(C.get("gift_to_box_top", height * 0.855))),
+        int(float(C.get("gift_to_box_right", box_right))),
+        int(float(C.get("gift_to_box_bottom", height * 0.93))),
+    )
     max_width = max(100, box_right - box_left - 24)
     line_color = tuple(C.get("gift_text_color", [255, 255, 255]))
     shadow = (0, 0, 0, 180)
-    for label, name, y in (("FROM:", sender_name, from_y), ("TO:", receiver_name, to_y)):
+    for label, name, y, (bx_left, bx_top, bx_right, bx_bottom) in (
+            ("FROM:", sender_name, from_y, from_box), ("TO:", receiver_name, to_y, to_box)):
         text = shape_text(f"{label} @{name}")
-        font = fit_font(text, max_width)
+        box_w = max(100, bx_right - bx_left)
+        box_h = max(40, bx_bottom - bx_top)
+        # ملاءمة الخط مع مربع المربع (العرض والارتفاع) وليس مع عرض الصورة كاملة.
+        font = fit_font(text, min(max_width, box_w - 24))
         bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
-        x = (width - (bbox[2] - bbox[0])) // 2
-        draw.text((x + 2, y + 2), text, font=font, fill=shadow, stroke_width=2, stroke_fill=shadow)
-        draw.text((x, y), text, font=font, fill=line_color, stroke_width=1, stroke_fill=(20, 20, 20, 220))
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        # توسيط أفقي داخل المربع
+        x = bx_left + (box_w - tw) / 2
+        # توسيط رأسي داخل المربع: مركز المربع ± نصف ارتفاع النص مع تصحيح الصعود/الهبوط
+        ascent, descent = font.getmetrics()
+        ty = bx_top + (box_h - th) / 2 - ascent / 2
+        draw.text((x + 2, ty + 2), text, font=font, fill=shadow, stroke_width=2, stroke_fill=shadow)
+        draw.text((x, ty), text, font=font, fill=line_color, stroke_width=1, stroke_fill=(20, 20, 20, 220))
     path = GIFT_RENDER_DIR / f"gift_{gift['display_id']}_{uuid.uuid4().hex}.png"
     image.save(path, "PNG", optimize=True)
     return path
@@ -863,7 +935,24 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
         await dm_send(sender_uid, f"✅ تم إرسال {gift['emoji']} {gift['name']} إلى @{receiver_name} بقيمة {gift['cost_points']} نقطة.")
     except Exception:
         log.exception("gift private notification failed")
-    # الهدية تُنفّذ مرة واحدة في الغرفة الأصلية، ثم يُنشر إعلانها وصورتها في كل غرف البوت الأخرى.
+    # الهدية تُسجّل أيضًا كمنشور حتى يمكن التفاعل معها (إعجاب/حب/تعليق) بنفس طريقة الأغاني والصور.
+    gift_pid = str(uuid.uuid4())
+    posts = load_published_posts()
+    posts[gift_pid] = {
+        "post_id": gift_pid, "owner_id": str(sender_uid), "owner_name": sender_name,
+        "source_room_id": str(rid), "type": "gift",
+        "title": f"هدية {gift['name']} لـ @{receiver_name}",
+        "created_at": now_iso()
+    }
+    save_published_posts(posts)
+    gift_code = _post_code()
+    _POST_CODES[gift_code] = gift_pid
+    await room_send(rid, (
+        f"🎁 هدية بالكود {gift_code} — يمكن التفاعل معها:\n"
+        f"❤️ Like@{gift_code} | 💖 Love@{gift_code} | 👎 Dislike@{gift_code}\n"
+        f"💬 Comment@{gift_code} [تعليق] | ✉️ msg@{gift_code} [رسالة]"
+    ))
+    # الهدية تُنشر إعلانها وصورتها في كل غرف البوت الأخرى.
     if image_url:
         await broadcast_media(f"🎁 هدية جديدة: {gift['emoji']} {gift['name']} | @{sender_name} ➜ @{receiver_name}",
                               image_url, m_type="image", exclude_rid=rid)
@@ -1068,14 +1157,22 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
             ]
             attempts = []
             if source_label == "YouTube":
-                # محاولة 1: بدون cookies؛ هذا يتجنب مشكلة YouTube الحالية مع بعض الجلسات المسجلة.
+                # محاولة 1: بدون cookies مع default+web_embedded (يتجنب مشكلة بعض الجلسات المسجلة).
                 for idx, fmt in enumerate(formats):
                     attempts.append((idx, fmt, False, ["default", "web_embedded"]))
-                # محاولة 2: cookies صحيحة مع العملاء الموصى بهم حالياً.
+                # محاولة 2: بدون cookies مع tv/tvos (عملاء يوتيوب TV لا يحتاجون PO Token عادة).
+                base2 = len(attempts)
+                for j, fmt in enumerate(formats):
+                    attempts.append((base2 + j, fmt, False, ["tv", "tvos", "web_embedded"]))
+                # محاولة 3: cookies صحيحة مع default+web_embedded+tv.
                 if has_youtube_cookies():
                     base = len(attempts)
                     for j, fmt in enumerate(formats):
-                        attempts.append((base + j, fmt, True, ["default", "web_embedded"]))
+                        attempts.append((base + j, fmt, True, ["default", "web_embedded", "tv", "tvos"]))
+                # محاولة 4: cookies + عميل mweb (أقل شيوعًا، قد يعمل مع بعض الفيديوهات).
+                if has_youtube_cookies():
+                    base_m = len(attempts)
+                    attempts.append((base_m, formats[0], True, ["mweb"]))
             else:
                 attempts = [(idx, fmt, True, None) for idx, fmt in enumerate(formats)]
 
@@ -1399,6 +1496,62 @@ async def start_media_server():
     await media_site.start()
     log.info("خادم ملفات الموسيقى يعمل على 0.0.0.0:%s | PUBLIC_BASE_URL=%s",
              MEDIA_SERVER_PORT, PUBLIC_BASE_URL or "(غير مضبوط)")
+
+
+CLEANUP_INTERVAL_SECONDS = 10 * 3600  # كل 10 ساعات
+GIFT_IMAGE_MAX_AGE_SECONDS = 30 * 60    # حذف صور الهدايا المولدة بعد 30 دقيقة
+
+
+def cleanup_bot_leftovers():
+    """تنظيف مخلفات البوت: صور الهدايا القديمة + الملفات المؤقتة."""
+    now = time.time()
+    removed_bytes = 0
+    # صور الهدايا المولدة أقدم من 30 دقيقة
+    if GIFT_RENDER_DIR.exists():
+        for file_path in GIFT_RENDER_DIR.glob("gift_*.png"):
+            try:
+                if now - file_path.stat().st_mtime > GIFT_IMAGE_MAX_AGE_SECONDS:
+                    removed_bytes += file_path.stat().st_size
+                    file_path.unlink()
+            except OSError:
+                pass
+    # الملفات المؤقتة في مجلد الموسيقى المنشورة (ملفات قديمة جدًا)
+    if PUBLISH_LOCAL_DIR.exists():
+        for file_path in PUBLISH_LOCAL_DIR.glob("*.*"):
+            try:
+                if now - file_path.stat().st_mtime > 3600:
+                    removed_bytes += file_path.stat().st_size
+                    file_path.unlink()
+            except OSError:
+                pass
+    # الملفات المؤقتة في tmp
+    try:
+        for file_path in Path(tempfile.gettempdir()).glob("alsfer_*.*"):
+            try:
+                if now - file_path.stat().st_mtime > 3600:
+                    removed_bytes += file_path.stat().st_size
+                    file_path.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return removed_bytes
+
+
+async def posts_and_leftovers_cleanup():
+    """عامل دوري كل 10 ساعات: حذف المنشورات المنتهية وتنظيف المخلفات."""
+    while True:
+        try:
+            posts = load_published_posts()
+            removed = _prune_expired_posts(posts)
+            if removed:
+                save_published_posts(posts)
+                log.info("cleanup: removed expired posts")
+            bytes_freed = cleanup_bot_leftovers()
+            log.info("cleanup leftovers: freed %d bytes", bytes_freed)
+        except Exception:
+            log.exception("cleanup loop failed")
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
 
 async def stop_media_server():
@@ -1783,7 +1936,7 @@ def friendly_music_error(error):
     """رسالة مفهومة للمستخدم، مع إبقاء الخطأ الخام للماستر."""
     e = str(error or "").lower()
     if "the page needs to be reloaded" in e:
-        return "❌ اتصلت بيوتيوب، لكن جلسة YouTube الحالية أعادت: The page needs to be reloaded. تم تجربة العملاء بدون Cookies ثم default/web_embedded؛ إذا استمر الخطأ فحدّث Cookies أو استخدم YOUTUBE_PLAYER_CLIENTS=default,web_embedded."
+        return "❌ يوتيوب أعاد «The page needs to be reloaded» مع كل العملاء (default, web_embedded, tv, tvos, mweb) وبكل المحاولات. السبب: جلسة YouTube في الكوكيز منتهية أو محظورة. الحل: حدّث cookies.txt بملف جديد من متصفحك (اذهب youtube.com وسجّل دخول ثم صدّر الكوكيز من Chrome DevTools أو إضافة Get cookies.txt)."
     if any(x in e for x in ("sign in to confirm", "not a bot", "captcha", "botguard", "po token", "http error 403", "403 forbidden")):
         return "❌ اتصلت بيوتيوب، لكن يوتيوب رفض الوصول/تحميل الصوت. السبب: تحقق/حظر جلسة YouTube أو PO Token أو Cookies غير صالحة."
     if any(x in e for x in ("clientconnectorerror", "cannot connect", "connection refused", "name or service not known", "temporary failure in name resolution", "timeout", "timed out")):
@@ -2055,11 +2208,15 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     if text.startswith("نشر ") or text.startswith("broadcast "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error: return vip_error
         msg = text.split(maxsplit=1)[1].strip()
         await broadcast_text("📢 " + msg)
         return "✅ تم نشر الرسالة في كل الغرف."
     if text.startswith("نشرصورة ") or text.startswith("broadcast_image "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error: return vip_error
         url = text.split(maxsplit=1)[1].strip()
         await broadcast_media("📢", url, m_type="image")
         return "✅ تم نشر الصورة في كل الغرف."
@@ -2070,6 +2227,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if lower_text.strip() in ("نشر@", "publish@") or text.startswith("نشر@ ") or text.startswith("publish@ "):
         if not await is_master(uid, p_name):
             return "🚫 للماستر فقط."
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error: return vip_error
         desc = ""
         base = lower_text.strip()
         if base.startswith(("نشر@ ", "publish@ ")):
@@ -2302,11 +2461,15 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         music_last_by_user[str(uid)] = now
         return None
 
-    # نسخة بدون توثيق VIP.
+    # كل أوامر الألعاب محمية بتوثيق VIP من صاحب البوت.
     if cmd in GAME_COMMANDS:
-        pass  # بدون توثيق VIP — كل المستخدمين يلعبون
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error:
+            return vip_error
 
     if cmd in ("تشغيل", "play", "شغل"):
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error: return vip_error
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
@@ -2314,12 +2477,16 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 @{p_name} جاري تنفيذ طلبك…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("مشاركة", "share"):
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error: return vip_error
         current = music_state.get(rid)
         if not current:
             return "❌ لا توجد أغنية حالياً للمشاركة."
         return f"🎵 مشاركة الأغنية\n🎶 {current.get('title','المقطع')} — {current.get('artist','')}\n🔗 {current.get('spotify_url') or current.get('youtube_url') or ''}"
 
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error: return vip_error
         if not arg:
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
         cd = await require_music_cooldown()
@@ -2328,6 +2495,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 @{p_name} جاري تنفيذ طلبك من Spotify…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
+        vip_error = None  # نسخة بدون توثيق
+        if vip_error: return vip_error
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
@@ -2557,6 +2726,33 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             msg += f"{emojis[i]} @{d['username']} ➔ {fmt_pts(d['points'])} ن\n"
         return msg + "━━━━━━━━━━━━━━━━━━━━"
 
+    if cmd in ("تفاعل", "interact", "تفاعلات"):
+        # أكثر المستخدمين تفاعلاً خلال آخر 30 يومًا من published_posts.json
+        posts = load_published_posts()
+        now = time.time()
+        month_seconds = 30 * 24 * 3600
+        scores = {}
+        for post in posts.values():
+            created = post.get("created_at", "")
+            try:
+                t = datetime.fromisoformat(str(created).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                t = 0.0
+            if not t or (now - t) > month_seconds:
+                continue
+            for entry in post.get("interactions", []) or []:
+                user = str(entry.get("user") or "").strip()
+                if user:
+                    scores[user] = scores.get(user, 0) + 1
+        if not scores:
+            return "📭 لا توجد تفاعلات خلال آخر 30 يومًا."
+        sorted_users = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:10]
+        emojis = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        msg = "📊 ━━━━ الأكثر تفاعلاً (30 يوم) ━━━━ 📊\n"
+        for i, (uname, count) in enumerate(sorted_users):
+            msg += f"{emojis[i] if i < 10 else str(i+1)} @{uname} ➔ {count} تفاعل\n"
+        return msg + "━━━━━━━━━━━━━━━━━━━━"
+
     # بقية الألعاب مع صور
     games_map = {
         "رشوة": ("bribe", 100, -50, 30, "💰 نجحت الرشوة!", "👮 تم القبض عليك!"),
@@ -2742,12 +2938,14 @@ async def main():
             await restore_saved_rooms()
         log.info("البوت جاهز كـ @%s", USERNAME)
         music_task = asyncio.create_task(music_worker_queue(), name="music-queue")
+        cleanup_task = asyncio.create_task(posts_and_leftovers_cleanup(), name="cleanup")
         try:
             await asyncio.gather(dm_loop(), room_loop(), heartbeat_loop(), session_loop(), network_loop())
         finally:
-            music_task.cancel()
-            try: await music_task
-            except asyncio.CancelledError: pass
+            for task in (cleanup_task, music_task):
+                task.cancel()
+                try: await task
+                except asyncio.CancelledError: pass
     finally:
         await stop_media_server()
         await http.close()
