@@ -102,6 +102,7 @@ YOUTUBE_COOKIES_PATH = str(C.get("youtube_cookies_path", "youtube_cookies.txt"))
 YOUTUBE_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
 TIKTOK_COOKIES_ENV = os.environ.get("TIKTOK_COOKIES", "").strip()
 SPOTIFY_COOKIES_ENV = os.environ.get("SPOTIFY_COOKIES", "").strip()
+YOUTUBE_PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
 
 
 def _normalize_cookie_text(raw):
@@ -171,6 +172,24 @@ def has_youtube_cookies():
     return bool(YOUTUBE_COOKIES_PATH) and os.path.isfile(YOUTUBE_COOKIES_PATH)
 
 
+def youtube_cookie_status():
+    if not has_youtube_cookies():
+        return False, "لم يتم العثور على ملف Cookies صالح في Railway (YOUTUBE_COOKIES)."
+    try:
+        text = Path(YOUTUBE_COOKIES_PATH).read_text(encoding="utf-8", errors="ignore")
+        rows = []
+        for line in text.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            if len(line.split("\t")) >= 7:
+                rows.append(line)
+        if not rows:
+            return False, "ملف YOUTUBE_COOKIES موجود لكنه لا يحتوي أسطر Netscape صحيحة (7 حقول مفصولة بـ TAB)."
+        return True, f"Cookies صالحة شكلياً: {len(rows)} سجل."
+    except Exception as e:
+        return False, f"تعذر قراءة ملف Cookies: {type(e).__name__}: {e}"
+
+
 def yt_base_options(source_label="YouTube"):
     """خيارات yt-dlp موحّدة لكل مصادر الصوت.
 
@@ -188,13 +207,19 @@ def yt_base_options(source_label="YouTube"):
         },
     }
     if source_label == "YouTube":
+        # YouTube في 2026 يفرض PO Tokens على بعض عملاء GVS.
+        # لا نستخدم mweb افتراضياً لأنه أكثر عرضة لـ403 بدون PO Token.
+        clients = str(os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "web_safari,tv,web")).strip()
+        client_list = [x.strip() for x in clients.split(",") if x.strip()]
+        if not client_list:
+            client_list = ["web_safari", "tv", "web"]
         if has_youtube_cookies():
             options["cookiefile"] = YOUTUBE_COOKIES_PATH
-            options["extractor_args"] = {"youtube": {"player_client": ["web", "mweb", "tv"]}}
-        else:
-            options["extractor_args"] = {
-                "youtube": {"player_client": ["tv", "ios", "web_safari", "web"]}
-            }
+        ex = {"youtube": {"player_client": client_list}}
+        if YOUTUBE_PO_TOKEN:
+            # الصيغة التي يفهمها yt-dlp: client.gvs+TOKEN أو client.player+TOKEN.
+            ex["youtube"]["po_token"] = YOUTUBE_PO_TOKEN
+        options["extractor_args"] = ex
     elif source_label == "TikTok" and os.path.isfile(TIKTOK_COOKIES_PATH):
         options["cookiefile"] = TIKTOK_COOKIES_PATH
     return options
@@ -289,28 +314,28 @@ def game_asset(filename):
     return f"assets/{filename}"
 
 GAME_IMAGES = {
-    "race": TWEMOJI + "1f3c1.png",
-    "bribe": TWEMOJI + "1f4b0.png",
-    "basket": TWEMOJI + "1f3c0.png",
-    "drone": TWEMOJI + "1f681.png",
-    "frog": TWEMOJI + "1f438.png",
-    "cards": TWEMOJI + "1f0cf.png",
-    "ball": TWEMOJI + "26bd.png",
+    "race": game_asset("game_race.jpg"),
+    "bribe": game_asset("game_bribe.jpg"),
+    "basket": game_asset("game_basket.jpg"),
+    "drone": game_asset("game_drone.jpg"),
+    "frog": game_asset("game_frog.jpg"),
+    "cards": game_asset("game_cards.jpg"),
+    "ball": game_asset("game_ball.jpg"),
     "boxing": game_asset("defense_action.jpg"),
     "fight": game_asset("fight_action.jpg"),
-    "job": TWEMOJI + "1f477.png",
-    "meet": TWEMOJI + "1f91d.png",
+    "job": game_asset("game_job.jpg"),
+    "meet": game_asset("game_meet.jpg"),
     "slap": game_asset("slap_action.jpg"),
-    "volcano": TWEMOJI + "1f30b.png",
-    "ghost": TWEMOJI + "1f47b.png",
-    "bet": TWEMOJI + "1f3b2.png",
-    "war": game_asset("fight_action.jpg"),
-    "rob": TWEMOJI + "1f4b0.png",
-    "luck": TWEMOJI + "1f340.png",
-    "dice": TWEMOJI + "1f3b2.png",
-    "marriage": TWEMOJI + "1f48d.png",
-    "challenge": TWEMOJI + "1f4aa.png",
-    "mine": TWEMOJI + "26cf.png"
+    "volcano": game_asset("game_volcano.jpg"),
+    "ghost": game_asset("game_ghost.jpg"),
+    "bet": game_asset("game_bet.jpg"),
+    "war": game_asset("war_game.png"),
+    "rob": game_asset("game_rob.jpg"),
+    "luck": game_asset("game_luck.jpg"),
+    "dice": game_asset("game_dice.jpg"),
+    "marriage": game_asset("game_marriage.jpg"),
+    "challenge": game_asset("game_challenge.jpg"),
+    "mine": game_asset("game_mine.jpg")
 }
 
 # ----------------------------- أدوات البيانات -----------------------------
@@ -776,11 +801,50 @@ async def report_music_error_to_masters(rid, source, query, error, stage="تشغ
 
 # ----------------------------- الموسيقى -----------------------------
 async def _yt_extract(search_query):
-    """Search YouTube metadata without requiring a playable format.
-    Playback/download is handled separately with several format fallbacks."""
+    """البحث عن فيديو YouTube بدون محاولة تنزيله.
+    نبدأ بـ yt-dlp ببحث flat حتى لا نفشل بسبب حظر استخراج صيغ الفيديو،
+    ثم نجرب Piped كاحتياط. نعيد سبب الفشل الحقيقي للتشخيص.
+    """
     q = str(search_query).strip()
     if q.lower().startswith("ytsearch1:"):
         q = q.split(":", 1)[1].strip()
+    errors = []
+
+    if yt_dlp is not None:
+        def extract():
+            options = yt_base_options("YouTube")
+            options.update({
+                "skip_download": True,
+                "extract_flat": True,
+                "default_search": "ytsearch1",
+            })
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{q}", download=False)
+                entry = (info.get("entries") or [None])[0] if info else info
+                if not entry:
+                    return None
+                vid = entry.get("id")
+                url = entry.get("webpage_url") or entry.get("original_url")
+                if not url and vid:
+                    url = f"https://www.youtube.com/watch?v={vid}"
+                return {
+                    "id": vid,
+                    "title": entry.get("title") or "المقطع",
+                    "artist": entry.get("uploader") or entry.get("channel") or "YouTube",
+                    "youtube_url": url,
+                    "thumbnail": entry.get("thumbnail"),
+                    "duration": entry.get("duration") or 0,
+                }
+        try:
+            track = await asyncio.to_thread(extract)
+            if track and track.get("youtube_url"):
+                return track, None
+            errors.append("yt-dlp: اتصلت بيوتيوب لكن البحث لم يُرجع نتائج.")
+        except Exception as e:
+            errors.append(f"yt-dlp: {type(e).__name__}: {e}")
+            log.warning("yt-dlp YouTube search failed: %s", e)
+    else:
+        errors.append("yt-dlp غير مثبت داخل الحاوية.")
 
     for api in PIPED_APIS:
         try:
@@ -790,6 +854,7 @@ async def _yt_extract(search_query):
                 headers={"User-Agent": "Mozilla/5.0"}
             ) as resp:
                 if resp.status != 200:
+                    errors.append(f"Piped {api}: HTTP {resp.status}")
                     continue
                 data = await resp.json(content_type=None)
             items = data.get("items") or []
@@ -804,115 +869,100 @@ async def _yt_extract(search_query):
                     "thumbnail": item.get("thumbnail"),
                     "duration": item.get("duration") or 0,
                     "piped_api": api,
-                }
+                }, None
         except Exception as e:
+            errors.append(f"Piped {api}: {type(e).__name__}: {e}")
             log.warning("Piped search failed %s: %s", api, e)
 
-    if yt_dlp is None:
-        return None
+    return None, " | ".join(errors[-5:]) if errors else "لم توجد نتائج من YouTube أو المصادر الاحتياطية."
 
-    def extract():
-        options = yt_base_options("YouTube")
-        options.update({"skip_download": True, "default_search": "ytsearch1"})
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
-            entry = (info.get("entries") or [None])[0] if info else info
-            if not entry:
-                return None
-            return {
-                "id": entry.get("id"), "title": entry.get("title") or "المقطع",
-                "artist": entry.get("uploader") or entry.get("artist") or "YouTube",
-                "youtube_url": entry.get("webpage_url") or entry.get("original_url"),
-                "thumbnail": entry.get("thumbnail"), "duration": entry.get("duration") or 0,
-            }
-    try:
-        return await asyncio.to_thread(extract)
-    except Exception as e:
-        log.warning("yt-dlp metadata search failed: %s", e)
-        return None
 async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=None):
-    """Download audio using Piped first, then multiple yt-dlp fallbacks.
-    This avoids failing when YouTube removes a particular requested format."""
+    """تنزيل الصوت مع تشخيص منفصل لكل محاولة."""
     temp_dir = Path(tempfile.mkdtemp(prefix="bot_audio_"))
+    errors = []
     try:
-        if piped_api and video_id:
-            try:
-                async with http.get(
-                    f"{piped_api}/streams/{video_id}",
-                    timeout=aiohttp.ClientTimeout(total=25),
-                    headers={"User-Agent": "Mozilla/5.0"}
-                ) as resp:
-                    if resp.status == 200:
-                        info = await resp.json(content_type=None)
-                        streams = info.get("audioStreams") or []
-                        streams = sorted(
-                            streams,
-                            key=lambda x: float(x.get("bitrate") or 0),
-                            reverse=True,
-                        )
-                        for stream in streams:
-                            url = stream.get("url")
-                            if not url:
-                                continue
-                            try:
-                                ext = ".m4a" if "mp4" in str(stream.get("mimeType", "")) else ".webm"
-                                out = temp_dir / f"audio{ext}"
-                                async with http.get(url, timeout=aiohttp.ClientTimeout(total=120)) as ar:
-                                    if ar.status == 200:
-                                        with out.open("wb") as f:
-                                            async for chunk in ar.content.iter_chunked(1024 * 256):
-                                                f.write(chunk)
-                                        if out.stat().st_size > 4096:
-                                            return out, None
-                            except Exception:
-                                continue
-            except Exception as e:
-                log.warning("Piped audio download failed: %s", e)
-
-        if yt_dlp is None:
-            return None, "مكتبة yt-dlp غير مثبتة، ولم يتوفر مصدر Piped."
+        # إذا كانت Cookies موجودة، نستخدم yt-dlp أولاً حتى يستفيد من جلسة YouTube.
+        prefer_ytdlp = source_label == "YouTube" and has_youtube_cookies()
 
         def download_with_format(fmt, suffix="audio"):
             options = yt_base_options(source_label)
             options.update({
                 "format": fmt,
                 "outtmpl": str(temp_dir / f"{suffix}.%(ext)s"),
+                "noplaylist": True,
             })
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([page_url])
 
-        # Try several selectors because available formats vary by video/client.
-        formats = [
-            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "bestaudio/best",
-            "best[ext=mp4]/best",
-        ]
-        last_error = None
-        for idx, fmt in enumerate(formats):
-            try:
-                for p in temp_dir.glob("*"):
-                    if p.is_file() and p.suffix not in (".part", ".ytdl"):
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
-                await asyncio.to_thread(download_with_format, fmt, f"audio_{idx}")
-                files = [
-                    p for p in temp_dir.iterdir()
-                    if p.is_file() and p.suffix not in (".part", ".ytdl") and p.stat().st_size > 4096
-                ]
-                if files:
-                    return max(files, key=lambda p: p.stat().st_size), None
-            except Exception as e:
-                last_error = e
-                log.warning("yt-dlp audio format failed (%s): %s", fmt, e)
+        async def try_ytdlp():
+            if yt_dlp is None:
+                errors.append("yt-dlp غير مثبت داخل Railway.")
+                return None
+            formats = [
+                "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "bestaudio/best",
+                "best[ext=mp4]/best",
+            ]
+            for idx, fmt in enumerate(formats):
+                try:
+                    for p in temp_dir.glob("*"):
+                        if p.is_file() and p.suffix not in (".part", ".ytdl"):
+                            try: p.unlink()
+                            except OSError: pass
+                    await asyncio.to_thread(download_with_format, fmt, f"audio_{idx}")
+                    files = [p for p in temp_dir.iterdir() if p.is_file() and p.suffix not in (".part", ".ytdl") and p.stat().st_size > 4096]
+                    if files:
+                        return max(files, key=lambda p: p.stat().st_size)
+                except Exception as e:
+                    errors.append(f"yt-dlp [{fmt}]: {type(e).__name__}: {e}")
+                    log.warning("yt-dlp audio failed (%s): %s", fmt, e)
+            return None
 
-        if last_error:
-            log.warning("All audio download formats failed: %s", last_error)
-        return None, f"{type(last_error).__name__}: {last_error}" if last_error else f"تعذر تنزيل الصوت من {source_label}: سبب غير معروف"
+        async def try_piped():
+            if not (piped_api and video_id):
+                return None
+            try:
+                async with http.get(f"{piped_api}/streams/{video_id}", timeout=aiohttp.ClientTimeout(total=25), headers={"User-Agent":"Mozilla/5.0"}) as resp:
+                    if resp.status != 200:
+                        errors.append(f"Piped {piped_api}: HTTP {resp.status}")
+                        return None
+                    info = await resp.json(content_type=None)
+                streams = sorted(info.get("audioStreams") or [], key=lambda x: float(x.get("bitrate") or 0), reverse=True)
+                for stream in streams:
+                    url = stream.get("url")
+                    if not url: continue
+                    try:
+                        ext = ".m4a" if "mp4" in str(stream.get("mimeType", "")) else ".webm"
+                        out = temp_dir / f"audio{ext}"
+                        async with http.get(url, timeout=aiohttp.ClientTimeout(total=120)) as ar:
+                            if ar.status != 200:
+                                continue
+                            with out.open("wb") as f:
+                                async for chunk in ar.content.iter_chunked(1024 * 256): f.write(chunk)
+                        if out.is_file() and out.stat().st_size > 4096:
+                            return out
+                    except Exception as e:
+                        errors.append(f"Piped audio stream: {type(e).__name__}: {e}")
+            except Exception as e:
+                errors.append(f"Piped {piped_api}: {type(e).__name__}: {e}")
+            return None
+
+        if prefer_ytdlp:
+            out = await try_ytdlp()
+            if out: return out, None
+            out = await try_piped()
+            if out: return out, None
+        else:
+            out = await try_piped()
+            if out: return out, None
+            out = await try_ytdlp()
+            if out: return out, None
+
+        return None, "تعذر تنزيل الصوت. " + " | ".join(errors[-6:])
     except Exception as e:
-        log.warning("%s audio download failed: %s", source_label, e)
+        log.exception("%s audio download failed", source_label)
         return None, f"{type(e).__name__}: {e}"
+
 async def _upload_bytes_storage(local_path, bucket, prefix, content_type):
     """رفع ملف إلى Supabase Storage وإرجاع رابط ثابت/عام."""
     if not bucket:
@@ -1012,7 +1062,8 @@ async def _store_media(local_path, kind="music", content_type=None):
     if base_url:
         target = local_dir / f"{uuid.uuid4().hex}{local_path.suffix.lower()}"
         shutil.copy2(local_path, target)
-        return f"{base_url}/{quote(target.name)}"
+        route = {"game": "/games", "publish": "/published", "music": MEDIA_PATH}.get(kind, "/media")
+        return f"{base_url}{route}/{quote(target.name)}"
 
     raise RuntimeError(
         f"تعذر نشر ملف {kind}: لم يتم تحديد PUBLIC_BASE_URL/Railway domain "
@@ -1143,6 +1194,13 @@ async def start_media_server():
             raise web.HTTPNotFound()
         return web.FileResponse(file_path, headers={"Cache-Control": "public, max-age=86400"})
 
+    async def published_handler(request):
+        name = os.path.basename(request.match_info.get("name", ""))
+        file_path = PUBLISH_LOCAL_DIR / name
+        if not file_path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(file_path, headers={"Cache-Control": "public, max-age=86400"})
+
     async def social_webhook(request):
         if SOCIAL_WEBHOOK_TOKEN and request.headers.get("X-Social-Token", "") != SOCIAL_WEBHOOK_TOKEN:
             raise web.HTTPUnauthorized()
@@ -1155,6 +1213,7 @@ async def start_media_server():
 
     app.router.add_get("/gifts/{name}", gift_handler)
     app.router.add_get("/games/{name}", game_handler)
+    app.router.add_get("/published/{name}", published_handler)
     app.router.add_post("/webhook", social_webhook)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -1292,7 +1351,7 @@ async def search_spotify(query):
     spotify_queries = [f"{title} {artist}", f"{title} {artist} audio", f"{title} {artist} official"]
     for sq in spotify_queries:
         try:
-            track = await _yt_extract(sq)
+            track, _search_err = await _yt_extract(sq)
             if track:
                 break
         except Exception as e:
@@ -1367,16 +1426,18 @@ async def search_track(query):
     errors = []
     for variant in variants:
         try:
-            track = await _yt_extract(variant)
+            track, search_err = await _yt_extract(variant)
             if track and track.get("youtube_url"):
                 track["source"] = "YouTube"
                 track["search_query"] = variant
                 return track, None
+            if search_err:
+                errors.append(f"{variant}: {search_err}")
         except Exception as e:
             errors.append(f"{variant}: {type(e).__name__}: {e}")
             log.warning("youtube search error (%s): %s", variant, e)
-    detail = " | ".join(errors[-2:]) if errors else "لا توجد نتائج من مصادر البحث"
-    return None, f"لم أجد الأغنية المطلوبة على يوتيوب. تفاصيل البحث: {detail}"
+    detail = " | ".join(errors[-4:]) if errors else "لا توجد نتائج من مصادر البحث"
+    return None, f"لم أجد الأغنية المطلوبة على يوتيوب. تفاصيل الاتصال/البحث: {detail}"
 
 
 async def search_tiktok(query):
@@ -1481,6 +1542,24 @@ async def play_track(rid, track, source_label):
     return True, None
 
 
+def friendly_music_error(error):
+    """رسالة مفهومة للمستخدم، مع إبقاء الخطأ الخام للماستر."""
+    e = str(error or "").lower()
+    if any(x in e for x in ("sign in to confirm", "not a bot", "captcha", "botguard", "po token", "http error 403", "403 forbidden")):
+        return "❌ اتصلت بيوتيوب، لكن يوتيوب رفض الوصول/تحميل الصوت. السبب المحتمل: Cookies منتهية أو غير صالحة، أو يوتيوب طلب PO Token/تحقق إضافي."
+    if any(x in e for x in ("clientconnectorerror", "cannot connect", "connection refused", "name or service not known", "temporary failure in name resolution", "timeout", "timed out")):
+        return "❌ لم أستطع التواصل مع يوتيوب من خادم Railway. فشل اتصال الشبكة قبل تحميل الأغنية."
+    if "لم يُرجع نتائج" in e or "no results" in e:
+        return "❌ تم الاتصال بمصدر البحث، لكن يوتيوب لم يُرجع نتيجة مطابقة للأغنية المطلوبة."
+    if "ffmpeg" in e or "تحويل الصوت" in e:
+        return "❌ تم الحصول على الصوت، لكن فشل تحويله إلى MP3 بواسطة FFmpeg."
+    if "public_base_url" in e or "رابط عام" in e or "/media/" in e:
+        return "❌ تم تجهيز الأغنية، لكن تعذر إنشاء رابط عام لملف الصوت. تحقق من PUBLIC_BASE_URL وPublic Domain في Railway."
+    if "room_messages" in e or "message_type" in e or "voice" in e:
+        return "❌ تم تجهيز ملف الصوت، لكن فشل إرسال رسالة الصوت إلى جينات شات."
+    return f"❌ تعذر تشغيل الأغنية. السبب: {str(error)[:700]}"
+
+
 async def music_worker_queue():
     global last_music_started
     interval = max(0, int(C.get("music_interval_seconds", 0)))
@@ -1510,20 +1589,21 @@ async def music_worker_queue():
                     track, err, used_source = alt_track, None, "TikTok"
 
             if err:
-                await room_send(rid, "❌ لم أتمكن من تشغيل هذه الأغنية الآن، جرّب اسماً آخر.")
-                await report_music_error_to_masters(rid, source, query, err, stage="البحث")
+                await room_send(rid, friendly_music_error(err))
+                await report_music_error_to_masters(rid, source, query, err, stage="البحث/الاتصال")
             else:
                 ok, out = await play_track(rid, track, used_source)
                 if not ok and out:
-                    await room_send(rid, "❌ تعذر تجهيز الصوت، حاول مرة أخرى.")
+                    await room_send(rid, friendly_music_error(out))
                     await report_music_error_to_masters(rid, used_source, query, out, stage="التنزيل/التجهيز/الإرسال")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.exception("music queue worker failed")
             try:
-                await room_send(rid, "❌ حدث خطأ أثناء تجهيز الصوت.")
-                await report_music_error_to_masters(rid, source, query, f"{type(exc).__name__}: {exc}", stage="استثناء غير متوقع")
+                detail = f"{type(exc).__name__}: {exc}"
+                await room_send(rid, friendly_music_error(detail))
+                await report_music_error_to_masters(rid, source, query, detail, stage="استثناء غير متوقع")
             except Exception:
                 pass
         finally:
@@ -1654,13 +1734,52 @@ async def _draw_game_text(draw, xy, text, font, fill=(30,30,30), anchor="ma"):
 def render_game_card_sync(game_key, title, lines):
     if not PIL_AVAILABLE:
         return None
+    # بطاقة حرب خاصة: سفينة مدمرة + اسم الفائز، بدلاً من إعادة صورة السفينة السليمة.
+    if game_key == "war":
+        outdir = BASE_DIR / "generated_games"
+        outdir.mkdir(exist_ok=True)
+        canvas = Image.new("RGB", (900, 860), (17, 21, 32))
+        d = ImageDraw.Draw(canvas)
+        font_path = BASE_DIR / "assets" / "Amiri-Bold.ttf"
+        try:
+            f_title = ImageFont.truetype(str(font_path), 48)
+            f_line = ImageFont.truetype(str(font_path), 32)
+        except Exception:
+            f_title = f_line = ImageFont.load_default()
+        # انفجار في منتصف البطاقة
+        cx, cy = 450, 300
+        for r, fill in [(155, (120,30,25)), (115, (190,70,25)), (75, (235,170,45)), (42, (255,230,150))]:
+            d.ellipse((cx-r, cy-r, cx+r, cy+r), fill=fill)
+        # سفينة مائلة ومدمرة
+        ship = [(240,430),(655,430),(590,500),(310,500)]
+        d.polygon(ship, fill=(135,145,160), outline=(235,240,245))
+        d.polygon([(330,430),(380,360),(445,430)], fill=(180,188,198))
+        d.polygon([(445,430),(505,345),(545,430)], fill=(160,168,180))
+        d.line((445,350,445,250), fill=(225,230,235), width=8)
+        d.polygon([(445,250),(520,275),(445,295)], fill=(205,45,45))
+        # شقوق الدمار
+        d.line((350,445,390,490), fill=(55,60,70), width=9)
+        d.line((470,440,530,490), fill=(55,60,70), width=9)
+        d.line((410,410,450,470), fill=(55,60,70), width=7)
+        _draw_game_text(d, (450, 75), title, f_title, fill=(255,255,255))
+        d.rounded_rectangle((55, 555, 845, 825), radius=28, fill=(255,255,255), outline=(215,218,223), width=3)
+        y=610
+        for line in lines[:4]:
+            _draw_game_text(d, (450, y), line, f_line, fill=(45,45,45))
+            y += 52
+        path = outdir / f"game_war_{uuid.uuid4().hex}.jpg"
+        canvas.save(path, quality=92, optimize=True)
+        return path
     source = GAME_IMAGES.get(game_key)
     # المصدر قد يكون رابطًا بعيدًا؛ نستخدم الصورة المحلية إن وجدت.
     local_map = {
-        "slap": "assets/slap_action.jpg", "war": "assets/fight_action.jpg",
+        "slap": "assets/slap_action.jpg", "war": "assets/war_game.png",
         "fight": "assets/fight_action.jpg", "boxing": "assets/defense_action.jpg"
     }
-    src = BASE_DIR / local_map.get(game_key, "assets/fight_action.jpg")
+    generated = BASE_DIR / "assets" / f"game_{game_key}.jpg"
+    src = BASE_DIR / local_map.get(game_key, f"assets/game_{game_key}.jpg")
+    if generated.is_file() and game_key not in local_map:
+        src = generated
     try:
         if src.is_file():
             im = Image.open(src).convert("RGB")
@@ -2326,6 +2445,9 @@ async def main():
         res, err = await run(lambda: sb.auth.sign_in_with_password({"email": email, "password": PASSWORD}))
         if err or not res.user: raise RuntimeError("فشل الدخول")
         BOT_ID = res.user.id
+        cookie_ok, cookie_msg = youtube_cookie_status()
+        log.info("YouTube cookies: %s | %s", "OK" if cookie_ok else "NOT-READY", cookie_msg)
+        log.info("YouTube player clients: %s | PO token: %s", os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "web_safari,tv,web"), "configured" if YOUTUBE_PO_TOKEN else "not configured")
         await prepare_game_assets()
         global AUTH_ACCESS_TOKEN
         AUTH_ACCESS_TOKEN = getattr(getattr(res, "session", None), "access_token", None)
