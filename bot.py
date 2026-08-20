@@ -105,16 +105,16 @@ TIKTOK_COOKIES_ENV = os.environ.get("TIKTOK_COOKIES", "").strip()
 SPOTIFY_COOKIES_ENV = os.environ.get("SPOTIFY_COOKIES", "").strip()
 YOUTUBE_PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
 
-# ---- نظام حسابات YouTube متعددة: YOUTUBE_ACCOUNTS ----
-# الصيغة: email1:cookies_text1 | email2:cookies_text2
-# أو بصيغة base64: email1:base64_cookies1 | email2:base64_cookies2
-# كل حساب له ملف cookies منفصل، والبوت يبدّل بينها تلقائيًا عند فشل تشغيل الأغاني
-YOUTUBE_ACCOUNTS_RAW = os.environ.get("YOUTUBE_ACCOUNTS", "").strip()
-_youtube_accounts = []  # list of {email, cookies_path, failures}
-_youtube_active_index = 0
-
-if YOUTUBE_ACCOUNTS_RAW:
-    for entry in YOUTUBE_ACCOUNTS_RAW.split("|"):
+# ---- نظام حسابات YouTube متعددة: YOUTUBE_ACCOUNTS, YOUTUBE_ACCOUNTS2, YOUTUBE_ACCOUNTS3 ----
+# كل متغير منفصل لتجنب التعارض. الصيغة: email:cookies_text
+# يدعم الكوكيز مباشرة (بدون base64) أو بصيغة base64: email:base64_cookies
+# البوت يحمّل كل المتغيرات ويبدّل بينها تلقائيًا عند فشل تشغيل الأغاني
+def _load_youtube_accounts_from_var(var_name, accounts_list):
+    """تحميل حسابات YouTube من متغير بيئي."""
+    raw = os.environ.get(var_name, "").strip()
+    if not raw:
+        return
+    for entry in raw.split("|"):
         entry = entry.strip()
         if not entry or ":" not in entry:
             continue
@@ -122,7 +122,7 @@ if YOUTUBE_ACCOUNTS_RAW:
         email = email.strip()
         cookies_text = cookies_text.strip()
         # فك تشفير base64 إذا كانت البيانات طويلة
-        if cookies_text.startswith("base64:"):
+        if cookies_text.lower().startswith("base64:"):
             import base64
             try:
                 cookies_text = base64.b64decode(cookies_text[7:]).decode("utf-8", errors="ignore")
@@ -131,11 +131,18 @@ if YOUTUBE_ACCOUNTS_RAW:
                 continue
         cookie_file = _write_cookie_file(cookies_text, f"/tmp/youtube_cookies_{email.replace('@','_').replace('.','_')}.txt")
         if cookie_file:
-            _youtube_accounts.append({"email": email, "cookies_path": cookie_file, "failures": 0})
-            log.info("تم تحميل حساب YouTube: %s", email)
+            accounts_list.append({"email": email, "cookies_path": cookie_file, "failures": 0})
+            log.info("تم تحميل حساب YouTube: %s (من %s)", email, var_name)
         else:
             log.warning("ملف cookies غير صالح لحساب %s", email)
 
+_youtube_accounts = []  # list of {email, cookies_path, failures}
+_youtube_active_index = 0
+_load_youtube_accounts_from_var("YOUTUBE_ACCOUNTS", _youtube_accounts)
+_load_youtube_accounts_from_var("YOUTUBE_ACCOUNTS2", _youtube_accounts)
+_load_youtube_accounts_from_var("YOUTUBE_ACCOUNTS3", _youtube_accounts)
+_load_youtube_accounts_from_var("YOUTUBE_ACCOUNTS4", _youtube_accounts)
+_load_youtube_accounts_from_var("YOUTUBE_ACCOUNTS5", _youtube_accounts)
 def get_active_youtube_cookies():
     """إرجاع مسار cookies للحساب النشط (يبدّل عند الفشل)."""
     if not _youtube_accounts:
@@ -213,7 +220,7 @@ def _write_cookie_file(raw, path):
         return None
 
 
-if YOUTUBE_COOKIES_ENV and not YOUTUBE_ACCOUNTS_RAW:
+if YOUTUBE_COOKIES_ENV and not _youtube_accounts:
     _yt_cookie_file = _write_cookie_file(YOUTUBE_COOKIES_ENV, "/tmp/youtube_cookies.txt")
     if _yt_cookie_file:
         YOUTUBE_COOKIES_PATH = _yt_cookie_file
@@ -1086,8 +1093,16 @@ async def room_send_media(rid, text, media_url, m_type="text", duration_ms=None)
         "message_type": m_type,
         "media_url": media_url,
         "media_duration_ms": duration_ms,
+        "client_id": "giant-bot",
     }
-    await run(lambda: sb.table("room_messages").insert(payload).execute())
+    # retry حتى 3 مرات
+    for attempt in range(3):
+        res, err = await run(lambda: sb.table("room_messages").insert(payload).execute())
+        if not err:
+            return
+        log.warning("room_send_media attempt %d failed for room %s: %s", attempt + 1, rid, err)
+        if attempt < 2:
+            await asyncio.sleep(1)
 
 async def dm_send(uid, text):
     envelope = {
@@ -2095,22 +2110,31 @@ async def play_track(rid, track, source_label, requester_id, requester_name, loc
             f"💖 Love@{code} 💬 Comment@{code}"
         )
     targets = [rid] if local_only else await all_room_ids()
+    sent_count = 0
+    failed_rooms = []
     for target_rid in targets:
+        duration_ms = int(float(track.get("duration") or 0) * 1000)
         try:
-            duration_ms = int(float(track.get("duration") or 0) * 1000)
-            # إرسال الرسالة الصوتية أولاً (تظهر فوق)، ثم النص تحتها
+            # إرسال الرسالة الصوتية أولاً (تظهر فوق)
             await room_send_media(
                 target_rid,
                 caption,
                 media_url, m_type="voice", duration_ms=duration_ms,
             )
+            # ثم إرسال النص تحتها
+            await room_send(target_rid, caption)
+            sent_count += 1
         except Exception as exc:
             log.exception("music broadcast failed room=%s", target_rid)
+            failed_rooms.append(target_rid)
             await report_music_error_to_masters(
                 target_rid, source_label, title,
                 f"{type(exc).__name__}: {exc}",
                 stage="إرسال تفاصيل/رسالة الصوت إلى الغرف"
             )
+    if not local_only:
+        log.info("music broadcast: sent=%d, total_targets=%d, failed=%s", sent_count, len(targets), failed_rooms)
+        await room_send(rid, f"✅ تم نشر الأغنية في {sent_count} غرفة من {len(targets)}.")
     return True, None
 
 def friendly_music_error(error):
@@ -2432,14 +2456,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     if text.startswith("نشر ") or text.startswith("broadcast "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         msg = text.split(maxsplit=1)[1].strip()
         await broadcast_text("📢 " + msg)
         return "✅ تم نشر الرسالة في كل الغرف."
     if text.startswith("نشرصورة ") or text.startswith("broadcast_image "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         url = text.split(maxsplit=1)[1].strip()
         await broadcast_media("📢", url, m_type="image")
@@ -2451,7 +2475,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if lower_text.strip() in ("نشر@", "publish@") or text.startswith("نشر@ ") or text.startswith("publish@ "):
         if not await is_master(uid, p_name):
             return "🚫 للماستر فقط."
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         desc = ""
         base = lower_text.strip()
@@ -2687,13 +2711,13 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     # كل أوامر الألعاب محمية بتوثيق VIP من صاحب البوت.
     if cmd in GAME_COMMANDS:
-        vip_error = None
+        err = None
         if vip_error:
             return vip_error
 
     # sa: تشغيل الأغنية ونشرها لكل الغرف
     if cmd == "sa":
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         if not arg: return "❌ اكتب: sa اسم الأغنية"
         cd = await require_music_cooldown()
@@ -2702,7 +2726,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 @{p_name} جاري تشغيل الأغنية ونشرها لكل الغرف…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("تشغيل", "play", "شغل"):
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
         cd = await require_music_cooldown()
@@ -2711,7 +2735,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 @{p_name} جاري تشغيل الأغنية في هذه الغرفة فقط…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("مشاركة", "share"):
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         current = music_state.get(rid)
         if not current:
@@ -2719,7 +2743,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 مشاركة الأغنية\n🎶 {current.get('title','المقطع')} — {current.get('artist','')}\n🔗 {current.get('spotify_url') or current.get('youtube_url') or ''}"
 
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         if not arg:
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
@@ -2729,7 +2753,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 @{p_name} جاري تنفيذ طلبك من Spotify…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
-        vip_error = None
+        err = None
         if vip_error: return vip_error
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
         cd = await require_music_cooldown()
@@ -3047,8 +3071,59 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if cmd in ("ايقاف", "stop"):
         ok, out = await stop(rid); return out
     if cmd in ("مساعدة", "help", ".help"): return HELP_ROOM
-    
+
+    # التحدث الذكي مع البوت — الرد على الرسائل العادية بدون أوامر
+    if AI_CHAT_ENABLED and text.strip() and not text.startswith("."):
+        # عدم الرد إذا كانت رسالة فارغة أو أمر (تبدأ بنقطة)
+        reply = await _ai_chat(rid, uid, p_name, text)
+        if reply:
+            return reply
     return None
+
+# ---- نظام التحدث الذكي مع البوت (AI Chat) ----
+AI_CHAT_ENABLED = bool(os.environ.get("AI_CHAT_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
+AI_CHAT_SYSTEM_PROMPT = os.environ.get(
+    "AI_CHAT_SYSTEM_PROMPT",
+    "أنت مساعد ذكي ودود في بوت تطبيق Giant Chat. رد باختصار وبأسلوب مرح وعصري. "
+    "يمكنك الإجابة عن الأسئلة العامة، تقديم نصائح، أو التحدث بشكل طبيعي. "
+    "إذا سُئلت عن أوامر البوت، اذكر: sa (تشغيل ونشر أغنية لكل الغرف)، تشغيل (أغنية في نفس الغرفة فقط)، "
+    "هدية (إرسال هدية)، حرب (لعبة)، نشر@ (نشر صورة لكل الغرف).",
+).strip()
+AI_CHAT_MAX_HISTORY = 4  # عدد آخر رسائل المستخدم في السياق
+_ai_chat_history = {}  # {(rid, uid): [(role, content)]}
+
+async def _ai_chat(rid, uid, p_name, text):
+    """التحدث الذكي مع البوت — يرد على الرسائل العادية بدون أوامر."""
+    if not AI_CHAT_ENABLED or not has_llm():
+        return None
+    try:
+        from openai import AsyncOpenAI
+        api_key = os.environ.get("OPENAI_API_KEY")
+        api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+        client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+
+        key = (str(rid), str(uid))
+        history = _ai_chat_history.get(key, [])
+        history.append({"role": "user", "content": text})
+        # الحفاظ على آخر N رسائل فقط
+        history = history[-AI_CHAT_MAX_HISTORY:]
+        _ai_chat_history[key] = history
+
+        messages = [
+            {"role": "system", "content": AI_CHAT_SYSTEM_PROMPT},
+            *history,
+        ]
+        resp = await client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            max_tokens=200,
+            temperature=0.8,
+        )
+        reply = resp.choices[0].message.content.strip()
+        return reply
+    except Exception as e:
+        log.warning("AI chat failed: %s", e)
+        return None
 
 async def run_cleanup():
     """تنظيف فوري للمخلفات عند طلب الماستر من الخاص."""
