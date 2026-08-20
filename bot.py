@@ -209,10 +209,10 @@ def yt_base_options(source_label="YouTube"):
     if source_label == "YouTube":
         # YouTube في 2026 يفرض PO Tokens على بعض عملاء GVS.
         # لا نستخدم mweb افتراضياً لأنه أكثر عرضة لـ403 بدون PO Token.
-        clients = str(os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "web_safari,tv,web")).strip()
+        clients = str(os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "default,web_embedded")).strip()
         client_list = [x.strip() for x in clients.split(",") if x.strip()]
         if not client_list:
-            client_list = ["web_safari", "tv", "web"]
+            client_list = ["default", "web_embedded"]
         if has_youtube_cookies():
             options["cookiefile"] = YOUTUBE_COOKIES_PATH
         ex = {"youtube": {"player_client": client_list}}
@@ -274,8 +274,9 @@ seen_dm = set()
 kaf_games = {}
 war_games = {}       # room_id -> حرب: لاعبَان، سفينة، 3 محاولات لكل لاعب
 last_music_started = 0.0
-music_queue = asyncio.Queue()      # room_id -> game data
+music_queue = asyncio.Queue()      # room_id, query, source, requester_id, requester_name
 music_state = {}     # room_id -> آخر أغنية شغّلها البوت
+music_last_by_user = {}  # user_id -> آخر طلب أغنية، فاصل مستقل دقيقتان لكل مستخدم
 music_tasks = {}      # room_id -> مهمة البحث/التشغيل الخلفية
 publish_pending = {}  # (room_id, user_id) -> وقت طلب نشر@
 SOCIAL_SEEN = set()
@@ -884,12 +885,22 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
         # إذا كانت Cookies موجودة، نستخدم yt-dlp أولاً حتى يستفيد من جلسة YouTube.
         prefer_ytdlp = source_label == "YouTube" and has_youtube_cookies()
 
-        def download_with_format(fmt, suffix="audio"):
+        def download_with_format(fmt, suffix="audio", use_cookies=True, clients=None):
             options = yt_base_options(source_label)
+            if source_label == "YouTube":
+                # بعض جلسات YouTube في أغسطس 2026 تعطي "The page needs to be reloaded"
+                # عند تمرير Cookies مع tv/web_safari. نجرّب أولاً بدون cookies، ثم
+                # جلسة cookies باستخدام default + web_embedded.
+                if not use_cookies:
+                    options.pop("cookiefile", None)
+                if clients:
+                    options["extractor_args"] = {"youtube": {"player_client": clients}}
             options.update({
                 "format": fmt,
                 "outtmpl": str(temp_dir / f"{suffix}.%(ext)s"),
                 "noplaylist": True,
+                "sleep_interval": 0.5,
+                "max_sleep_interval": 1.5,
             })
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([page_url])
@@ -903,19 +914,33 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
                 "bestaudio/best",
                 "best[ext=mp4]/best",
             ]
-            for idx, fmt in enumerate(formats):
+            attempts = []
+            if source_label == "YouTube":
+                # محاولة 1: بدون cookies؛ هذا يتجنب مشكلة YouTube الحالية مع بعض الجلسات المسجلة.
+                for idx, fmt in enumerate(formats):
+                    attempts.append((idx, fmt, False, ["default", "web_embedded"]))
+                # محاولة 2: cookies صحيحة مع العملاء الموصى بهم حالياً.
+                if has_youtube_cookies():
+                    base = len(attempts)
+                    for j, fmt in enumerate(formats):
+                        attempts.append((base + j, fmt, True, ["default", "web_embedded"]))
+            else:
+                attempts = [(idx, fmt, True, None) for idx, fmt in enumerate(formats)]
+
+            for idx, fmt, use_cookies, clients in attempts:
                 try:
                     for p in temp_dir.glob("*"):
                         if p.is_file() and p.suffix not in (".part", ".ytdl"):
                             try: p.unlink()
                             except OSError: pass
-                    await asyncio.to_thread(download_with_format, fmt, f"audio_{idx}")
+                    await asyncio.to_thread(download_with_format, fmt, f"audio_{idx}", use_cookies, clients)
                     files = [p for p in temp_dir.iterdir() if p.is_file() and p.suffix not in (".part", ".ytdl") and p.stat().st_size > 4096]
                     if files:
                         return max(files, key=lambda p: p.stat().st_size)
                 except Exception as e:
-                    errors.append(f"yt-dlp [{fmt}]: {type(e).__name__}: {e}")
-                    log.warning("yt-dlp audio failed (%s): %s", fmt, e)
+                    cookie_tag = "cookies" if use_cookies else "بدون-cookies"
+                    errors.append(f"yt-dlp [{fmt}][{cookie_tag}]: {type(e).__name__}: {e}")
+                    log.warning("yt-dlp audio failed (%s,%s): %s", fmt, cookie_tag, e)
             return None
 
         async def try_piped():
@@ -1493,60 +1518,111 @@ async def search_tiktok(query):
         return None, "تعذر الوصول إلى TikTok من الخادم. إذا كان الخادم PythonAnywhere المجاني فلن تعمل هذه الميزة بسبب قيود الإنترنت الخارجية."
 
 
-async def play_track(rid, track, source_label):
+async def render_music_card(track, requester_name, source_room):
+    """بطاقة أغنية بنفس فكرة بطاقات بوت سهم: صورة كبيرة + معلومات الطلب والتفاعل."""
+    if not PIL_AVAILABLE:
+        return None
+    outdir = BASE_DIR / "generated_music_cards"
+    outdir.mkdir(parents=True, exist_ok=True)
+    canvas = Image.new("RGB", (900, 980), (245, 247, 250))
+    d = ImageDraw.Draw(canvas)
+    thumb = None
+    thumb_url = track.get("thumbnail")
+    if thumb_url:
+        try:
+            async with http.get(thumb_url, timeout=aiohttp.ClientTimeout(total=12), headers={"User-Agent":"Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    import io
+                    thumb = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception:
+            thumb = None
+    if thumb is None:
+        thumb = Image.new("RGB", (900, 560), (28, 42, 65))
+        td = ImageDraw.Draw(thumb)
+        td.text((450, 280), "🎵 GENAT CHAT", fill=(255,255,255), anchor="mm")
+    thumb.thumbnail((860, 570), Image.LANCZOS)
+    canvas.paste(thumb, ((900-thumb.width)//2, 20))
+    font_path = BASE_DIR / "assets" / "Amiri-Bold.ttf"
+    try:
+        f_title=ImageFont.truetype(str(font_path), 42); f_line=ImageFont.truetype(str(font_path), 31); f_small=ImageFont.truetype(str(font_path), 26)
+    except Exception:
+        f_title=f_line=f_small=ImageFont.load_default()
+    d.rounded_rectangle((55, 620, 845, 940), radius=28, fill=(255,255,255), outline=(215,218,223), width=3)
+    _draw_game_text(d, (450, 665), "🎵 تشغيل | أغنية", f_title, fill=(35,35,45))
+    _draw_game_text(d, (450, 720), str(track.get("title") or "الأغنية"), f_line, fill=(45,45,45))
+    _draw_game_text(d, (450, 770), f"👤 الطلب بواسطة: @{requester_name}", f_small, fill=(65,65,65))
+    _draw_game_text(d, (450, 815), f"🏠 الغرفة: {source_room}", f_small, fill=(65,65,65))
+    _draw_game_text(d, (450, 870), "❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق", f_small, fill=(65,65,65))
+    _draw_game_text(d, (450, 915), "▶️ اضغط تشغيل من مشغل الصوت", f_small, fill=(65,65,65))
+    path=outdir/f"music_{uuid.uuid4().hex}.jpg"
+    canvas.save(path, quality=92, optimize=True)
+    return path
+
+async def play_track(rid, track, source_label, requester_id, requester_name):
     if not track:
         return False, "لم أجد المقطع المطلوب"
-
+    source_room = rooms.get(rid, "الغرفة")
     track, err = await _prepare_music_track(track, source_label)
     if err:
         return False, err
-
-    track.update({"requester_id": BOT_ID, "requester_name": USERNAME})
+    track.update({"requester_id": str(requester_id), "requester_name": requester_name, "source_room": source_room})
     music_state[rid] = track
     title = track.get("title", "المقطع")
     artist = track.get("artist", source_label)
     media_url = track.get("audio_url")
     if not media_url:
-        # لا نُخفي الرابط إذا فشل التنزيل: إرسال الرابط المباشر يسمح للعميل
-        # بفتحه/تشغيله إذا كان Giant Chat يدعم تشغيل روابط الوسائط.
         direct_url = track.get("youtube_url") or track.get("spotify_url") or track.get("tiktok_url")
         if direct_url:
-            title = track.get("title", "المقطع")
-            artist = track.get("artist", source_label)
-            await room_send(
-                rid,
-                f"🎵 {title} — {artist}\n▶️ {direct_url}"
-            )
-            await report_music_error_to_masters(
-                rid, source_label, title,
-                "تعذر تنزيل ملف الصوت، تم إرسال الرابط المباشر بدل البصمة الصوتية.",
-                stage="بديل الرابط",
-            )
+            await room_send(rid, f"🎵 @{requester_name} — جاري تشغيل: {title}\n🏠 الغرفة: {source_room}\n▶️ {direct_url}")
             return True, None
-        return False, "تعذر تجهيز ملف الصوت ولا يوجد رابط تشغيل مباشر"
+        return False, "تم الوصول للنتيجة لكن لم يتم إنشاء ملف صوتي ولا رابط تشغيل مباشر."
 
-    if track.get("thumbnail"):
-        await room_send_media(rid, f"🖼️ {title}", track["thumbnail"], m_type="image")
-
-    duration_ms = int(float(track.get("duration") or 0) * 1000)
-    await room_send(rid, f"🎵 تشغيل من {source_label}\n🎶 {title} — {artist}")
-    log.info("إرسال صوت Giant Chat: room=%s type=voice format=%s url=%s",
-             rid, track.get("media_format", ""), media_url)
-    await room_send_media(
-        rid,
-        f"▶️ تشغيل الصوت\n🎵 {title} — {artist}",
-        media_url,
-        m_type="voice",
-        duration_ms=duration_ms,
+    # بطاقة الأغنية وتسجيلها كمنشور حتى تصل التفاعلات لصاحب الطلب.
+    card_path = await render_music_card(track, requester_name, source_room)
+    card_url = None
+    if card_path:
+        try:
+            card_url = await _store_media(card_path, "publish", "image/jpeg")
+        finally:
+            try: card_path.unlink(missing_ok=True)
+            except Exception: pass
+    post_id = str(uuid.uuid4())
+    posts = load_published_posts()
+    posts[post_id] = {
+        "post_id": post_id, "owner_id": str(requester_id), "owner_name": requester_name,
+        "source_room_id": str(rid), "type": "music", "title": title,
+        "media_url": card_url or track.get("thumbnail"), "audio_url": media_url, "created_at": now_iso()
+    }
+    save_published_posts(posts)
+    caption = (
+        f"🎵 تشغيل الأغنية\n🎶 {title} — {artist}\n"
+        f"👤 الطلب بواسطة: @{requester_name}\n🏠 الغرفة: {source_room}\n"
+        f"🆔 {post_id}\n❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
     )
+    targets = await all_room_ids()
+    for target_rid in targets:
+        try:
+            if card_url:
+                await room_send_media(target_rid, caption, card_url, m_type="image")
+            duration_ms = int(float(track.get("duration") or 0) * 1000)
+            await room_send_media(
+                target_rid,
+                f"▶️ تشغيل | {title}\n👤 @{requester_name}\n🏠 {source_room}",
+                media_url, m_type="voice", duration_ms=duration_ms,
+            )
+        except Exception as exc:
+            log.exception("music broadcast failed room=%s", target_rid)
+            await report_music_error_to_masters(target_rid, source_label, title, f"{type(exc).__name__}: {exc}", stage="إرسال الأغنية إلى الغرف")
     return True, None
-
 
 def friendly_music_error(error):
     """رسالة مفهومة للمستخدم، مع إبقاء الخطأ الخام للماستر."""
     e = str(error or "").lower()
+    if "the page needs to be reloaded" in e:
+        return "❌ اتصلت بيوتيوب، لكن جلسة YouTube الحالية أعادت: The page needs to be reloaded. تم تجربة العملاء بدون Cookies ثم default/web_embedded؛ إذا استمر الخطأ فحدّث Cookies أو استخدم YOUTUBE_PLAYER_CLIENTS=default,web_embedded."
     if any(x in e for x in ("sign in to confirm", "not a bot", "captcha", "botguard", "po token", "http error 403", "403 forbidden")):
-        return "❌ اتصلت بيوتيوب، لكن يوتيوب رفض الوصول/تحميل الصوت. السبب المحتمل: Cookies منتهية أو غير صالحة، أو يوتيوب طلب PO Token/تحقق إضافي."
+        return "❌ اتصلت بيوتيوب، لكن يوتيوب رفض الوصول/تحميل الصوت. السبب: تحقق/حظر جلسة YouTube أو PO Token أو Cookies غير صالحة."
     if any(x in e for x in ("clientconnectorerror", "cannot connect", "connection refused", "name or service not known", "temporary failure in name resolution", "timeout", "timed out")):
         return "❌ لم أستطع التواصل مع يوتيوب من خادم Railway. فشل اتصال الشبكة قبل تحميل الأغنية."
     if "لم يُرجع نتائج" in e or "no results" in e:
@@ -1564,7 +1640,8 @@ async def music_worker_queue():
     global last_music_started
     interval = max(0, int(C.get("music_interval_seconds", 0)))
     while True:
-        rid, query, source = await music_queue.get()
+        item = await music_queue.get()
+        rid, query, source, requester_id, requester_name = item
         try:
             wait = interval - (time.time() - last_music_started)
             if wait > 0:
@@ -1592,7 +1669,7 @@ async def music_worker_queue():
                 await room_send(rid, friendly_music_error(err))
                 await report_music_error_to_masters(rid, source, query, err, stage="البحث/الاتصال")
             else:
-                ok, out = await play_track(rid, track, used_source)
+                ok, out = await play_track(rid, track, used_source, requester_id, requester_name)
                 if not ok and out:
                     await room_send(rid, friendly_music_error(out))
                     await report_music_error_to_masters(rid, used_source, query, out, stage="التنزيل/التجهيز/الإرسال")
@@ -1816,7 +1893,7 @@ async def send_game_card(rid, game_key, title, lines, fallback_text=None):
     if path:
         try:
             url = await _store_media(path, "game", "image/jpeg")
-            await room_send_media(rid, title, url, m_type="image")
+            await room_send_media(rid, title + "\n❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق", url, m_type="image")
             try: path.unlink(missing_ok=True)
             except Exception: pass
             return
@@ -2023,17 +2100,26 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     GAME_COMMANDS = {"عمل","job","كف","slap","مضاربة","bet","حرب","war","سرقة","rob","قتال","fight",
                      "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين"}
 
-    async def require_game_cooldown():
-        ok_cd, rem_cd = await game_cooldown(uid, p_name)
+    async def require_game_cooldown(game_command):
+        ok_cd, rem_cd = check_cooldown(uid, p_name, f"game:{game_command}", int(C.get("game_cooldown_seconds", 30)))
         if not ok_cd:
-            return f"⏳ @{p_name} انتظر {rem_cd} ثانية قبل إعادة اللعب. الفاصل 30 ثانية لك أنت فقط."
+            return f"⏳ @{p_name} انتظر {rem_cd} ثانية قبل إعادة لعبة «{game_command}». الفاصل 30 ثانية لهذه اللعبة فقط."
+        return None
+
+    async def require_music_cooldown():
+        now = time.time(); last = music_last_by_user.get(str(uid), 0.0); interval = int(C.get("music_interval_seconds", 120))
+        remaining = int(interval - (now-last)) if now-last < interval else 0
+        if remaining > 0:
+            return f"⏳ @{p_name} انتظر {remaining} ثانية قبل طلب أغنية أخرى. فاصل الأغاني دقيقتان لك."
+        music_last_by_user[str(uid)] = now
         return None
 
     if cmd in ("تشغيل", "play", "شغل"):
-
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
-        await music_queue.put((rid, arg, "YouTube"))
-        return "🎵 جاري تجهيز الأغنية من المصدر المتاح..."
+        cd = await require_music_cooldown()
+        if cd: return cd
+        await music_queue.put((rid, arg, "YouTube", uid, p_name))
+        return f"🎵 @{p_name} جاري تنفيذ طلبك…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("مشاركة", "share"):
         current = music_state.get(rid)
@@ -2044,13 +2130,17 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
         if not arg:
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
-        await music_queue.put((rid, arg, "Spotify"))
-        return "🎵 جاري تجهيز الأغنية من Spotify..."
+        cd = await require_music_cooldown()
+        if cd: return cd
+        await music_queue.put((rid, arg, "Spotify", uid, p_name))
+        return f"🎵 @{p_name} جاري تنفيذ طلبك من Spotify…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
-        await music_queue.put((rid, arg, "TikTok"))
-        return "🎵 جاري تجهيز صوت TikTok..."
+        cd = await require_music_cooldown()
+        if cd: return cd
+        await music_queue.put((rid, arg, "TikTok", uid, p_name))
+        return f"🎵 @{p_name} جاري تنفيذ طلبك من TikTok…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     # لعبة الحرب: لاعبان، سفينة في 1..6، 3 محاولات لكل لاعب، مع انتهاء تلقائي.
     if cmd in ("حرب", "war"):
@@ -2064,7 +2154,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game = None
 
         if not game:
-            cd_error = await require_game_cooldown()
+            cd_error = await require_game_cooldown(cmd)
             if cd_error:
                 return cd_error
             war_games[key] = {
@@ -2160,42 +2250,44 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             return None
 
     if cmd in ("سرقة", "rob"):
+        cd_error = await require_game_cooldown(cmd)
+        if cd_error: return cd_error
         win = random.randint(1, 100) <= 40
         add_points(uid, p_name, 25 if win else -15)
-        await room_send_media(rid, f"💰 {'نجحت السرقة!' if win else 'فشلت السرقة..'} @{p_name}\n💵 النتيجة: {'+25' if win else '-15'} نقطة.", GAME_IMAGES["rob"])
+        await send_game_card(rid, "rob", "💰 Rob | سرقة", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {'+25' if win else '-15'} نقطة"], f"💰 {'نجحت السرقة!' if win else 'فشلت السرقة..'} @{p_name}")
         return None
 
     if cmd in ("قتال", "fight"):
+        cd_error = await require_game_cooldown(cmd)
+        if cd_error: return cd_error
         win = random.choice([True, False])
         add_points(uid, p_name, 15 if win else -5)
-        await room_send_media(rid, f"🥊 {'هزمت خصمك!' if win else 'تلقيت ضربة قاضية..'} @{p_name}\n💰 النتيجة: {'+15' if win else '-5'} نقطة.", GAME_IMAGES["fight"])
+        await send_game_card(rid, "fight", "🥊 Fight | قتال", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {'+15' if win else '-5'} نقطة"], f"🥊 {'هزمت خصمك!' if win else 'تلقيت ضربة قاضية..'} @{p_name}")
         return None
 
     if cmd in ("عمل", "job"):
-        ok, rem = check_cooldown(uid, p_name, "work", 3600)
-        if not ok: return f"⏳ | عد للعمل بعد {rem // 60} دقيقة."
-        cd_error = await require_game_cooldown()
-        if cd_error:
-            return cd_error
-        salary = random.randint(50, 150)
-        add_points(uid, p_name, salary)
-        await room_send_media(rid, f"👷 | عملت بجد يا @{p_name}.\n💵 راتبك: {salary} نقطة.", GAME_IMAGES["job"])
+        cd_error = await require_game_cooldown(cmd)
+        if cd_error: return cd_error
+        salary = random.randint(50, 150); add_points(uid, p_name, salary)
+        await send_game_card(rid, "job", "💼 Work | عمل", [f"👤 اللاعب: @{p_name}", f"💵 الراتب: +{salary} نقطة", "🏆 النتيجة: فوز"], f"💼 عمل @{p_name} +{salary} نقطة")
         return None
 
     if cmd in ("سباق", "race"):
+        cd_error = await require_game_cooldown(cmd)
+        if cd_error: return cd_error
         win = random.choice([True, False])
         add_points(uid, p_name, 30 if win else -10)
-        await room_send_media(rid, f"🏁 {'فزت بالسباق!' if win else 'تعطلت سيارتك..'} @{p_name}\n💰 النتيجة: {'+30' if win else '-10'} نقطة.", GAME_IMAGES["race"])
+        await send_game_card(rid, "race", "🏁 Race | سباق", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {'+30' if win else '-10'} نقطة"], f"🏁 {'فزت بالسباق!' if win else 'تعطلت سيارتك..'} @{p_name}")
         return None
 
     if cmd in ("كف", "slap"):
         game = kaf_games.get(f"slap_{rid}")
         if not game:
-            cd_error = await require_game_cooldown()
+            cd_error = await require_game_cooldown(cmd)
             if cd_error:
                 return cd_error
             kaf_games[f"slap_{rid}"] = {"player1": uid, "p1_name": p_name}
-            await room_send_media(rid, f"✅ {p_name}\nwaiting for an opponent for automatic slap game...", GAME_IMAGES["slap"])
+            await send_game_card(rid, "slap", "👏💢 Slap | كف 💢👏", [f"👤 @{p_name}", "⏳ جاري انتظار الخصم", "🎮 اكتب كف للانضمام"], f"⏳ @{p_name} جاري انتظار الخصم...")
         else:
             if game["player1"] == uid: return "⚠️ أنت تنتظر منافس!"
             p1_name = game["p1_name"]
@@ -2213,11 +2305,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         game_key = f"bet_{rid}"
         game = kaf_games.get(game_key)
         if not game:
-            cd_error = await require_game_cooldown()
+            cd_error = await require_game_cooldown(cmd)
             if cd_error:
                 return cd_error
             kaf_games[game_key] = {"player1": uid, "p1_name": p_name, "amount": amount}
-            await room_send_media(rid, f"🎲 | @{p_name} يراهن بـ {amount} نقطة!\nاكتب مضاربة {amount} للقبول أو انتظر البوت.", GAME_IMAGES["bet"])
+            await send_game_card(rid, "bet", "🎲 Bet | مضاربة", [f"👤 اللاعب: @{p_name}", f"💰 الرهان: {amount} نقطة", "⏳ جاري انتظار الخصم"], f"🎲 @{p_name} يراهن بـ {amount} نقطة")
             async def bot_bet():
                 await asyncio.sleep(30)
                 g = kaf_games.get(game_key)
@@ -2225,7 +2317,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                     win = random.choice([True, False])
                     kaf_games.pop(game_key)
                     add_points(uid, p_name, amount if win else -amount)
-                    await room_send_media(rid, f"🤖 | {'فزت على البوت!' if win else 'خسرت ضد البوت..'} @{p_name}\n💰 النتيجة: {amount if win else -amount} ن.", GAME_IMAGES["bet"])
+                    await send_game_card(rid, "bet", "🎲 Bet | مضاربة", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {amount if win else -amount} نقطة"], f"🤖 {'فزت على البوت!' if win else 'خسرت ضد البوت..'} @{p_name}")
             asyncio.create_task(bot_bet())
         else:
             if game["player1"] == uid: return "⚠️ أنت صاحب الرهان!"
@@ -2235,7 +2327,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             kaf_games.pop(game_key)
             add_points(uid if winner == p_name else game["player1"], winner, amount)
             add_points(game["player1"] if winner == p_name else uid, p1_name if winner == p_name else p_name, -amount)
-            await room_send_media(rid, f"🎲 | تمت المضاربة بين @{p1_name} و @{p_name}..\n🏆 الفائز: @{winner}!", GAME_IMAGES["bet"])
+            await send_game_card(rid, "bet", "🎲 Bet | مضاربة", [f"🥊 @{p1_name} × @{p_name}", f"🏆 Winner | الفائز: @{winner}", f"💰 الرهان: {amount} نقطة"], f"🎲 تمت المضاربة بين @{p1_name} و @{p_name}..\n🏆 الفائز: @{winner}")
         return None
 
     if cmd in ("طرد", "kick"):
@@ -2289,7 +2381,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     }
     
     if cmd in games_map:
-        cd_error = await require_game_cooldown()
+        cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
         key, win_p, lose_p, chance, win_m, lose_m = games_map[cmd]
@@ -2299,23 +2391,23 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return None
 
     if cmd == "تعدين":
-        cd_error = await require_game_cooldown()
+        cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
-        ok, rem = check_cooldown(uid, p_name, "mine", 14400)
-        if not ok: return f"⛏️ عد بعد {rem // 3600} ساعة."
         found = random.randint(200, 500); add_points(uid, p_name, found)
-        await room_send_media(rid, f"⛏️ وجدت ذهباً! @{p_name}\n💰 كسبت {found} ن.", GAME_IMAGES["mine"])
+        await send_game_card(rid, "mine", "⛏️ Mine | تعدين", [f"👤 اللاعب: @{p_name}", "🏆 Winner | الفائز", f"💰 النتيجة: +{found} نقطة"], f"⛏️ وجدت ذهباً! @{p_name} +{found} ن.")
         return None
 
     if cmd == "زواج":
+        cd_error = await require_game_cooldown(cmd)
+        if cd_error: return cd_error
         pts, d = get_user_data(uid, p_name)
         if d.get("married_to"): return f"💍 متزوج من @{d['married_to']}"
         others = [u["username"] for i, u in pts.items() if i != uid]
         if not others: return "💔 لا أحد للزواج."
         partner = random.choice(others); d["married_to"] = partner
         pts[uid] = d; save_json(POINTS_PATH, pts)
-        await room_send_media(rid, f"❤️ مبروك زواج @{p_name} من @{partner} 💍", GAME_IMAGES["marriage"])
+        await send_game_card(rid, "marriage", "💍 Marriage | زواج", [f"👤 اللاعب: @{p_name}", f"❤️ الشريك: @{partner}", "🏆 تمت العملية بنجاح"], f"❤️ مبروك زواج @{p_name} من @{partner} 💍")
         return None
 
     if cmd in ("تخطي", "skip"):

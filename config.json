@@ -8,7 +8,7 @@
   "poll_seconds": 2,
   "music_search_url": "https://giant-chat-app.lovable.app/api/public/search-track",
   "youtube_cookies_path": "youtube_cookies.txt",
-  "music_interval_seconds": 0,
+  "music_interval_seconds": 120,
   "music_bucket": "bot-music",
   "music_storage": "railway",
   "music_local_dir": "generated_music",
@@ -34,5 +34,6 @@
   "music_direct_link_text": "▶️ تشغيل الرابط",
   "game_storage": "supabase",
   "game_local_dir": "generated_games",
-  "social_webhook_token": ""
+  "social_webhook_token": "",
+  "youtube_player_clients": "default,web_embedded"
 }
