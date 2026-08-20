@@ -413,10 +413,7 @@ async def is_vip(uid, username):
     return False
 
 async def require_vip(uid, username, feature="هذه الخدمة"):
-    if await is_vip(uid, username):
-        return None
-    return (f"🔒 @{username} هذه {feature} تتطلب توثيق VIP من صاحب البوت.\n"
-            f"📌 طريقة التوثيق: صاحب البوت يكتب vip@اسم_المستخدم")
+    return None
 
 async def grant_vip_by_username(target_username):
     target = str(target_username or '').replace('@', '').strip()
