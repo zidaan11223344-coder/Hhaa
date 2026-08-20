@@ -1578,42 +1578,43 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
             return True, None
         return False, "تم الوصول للنتيجة لكن لم يتم إنشاء ملف صوتي ولا رابط تشغيل مباشر."
 
-    # بطاقة الأغنية وتسجيلها كمنشور حتى تصل التفاعلات لصاحب الطلب.
-    card_path = await render_music_card(track, requester_name, source_room)
-    card_url = None
-    if card_path:
-        try:
-            card_url = await _store_media(card_path, "publish", "image/jpeg")
-        finally:
-            try: card_path.unlink(missing_ok=True)
-            except Exception: pass
+    # تسجيل الأغنية كمنشور بدون إنشاء صورة للأغنية، حتى تبقى التفاعلات
+    # (إعجاب/حب/تعليق) مرتبطة بصاحب الطلب عبر post_id.
     post_id = str(uuid.uuid4())
     posts = load_published_posts()
     posts[post_id] = {
         "post_id": post_id, "owner_id": str(requester_id), "owner_name": requester_name,
         "source_room_id": str(rid), "type": "music", "title": title,
-        "media_url": card_url or track.get("thumbnail"), "audio_url": media_url, "created_at": now_iso()
+        "media_url": media_url, "audio_url": media_url, "created_at": now_iso()
     }
     save_published_posts(posts)
+
+    # المطلوب: تفاصيل الأغنية كنص أولاً، ثم رسالة الصوت وحدها. لا صورة للأغنية.
     caption = (
-        f"🎵 تشغيل الأغنية\n🎶 {title} — {artist}\n"
-        f"👤 الطلب بواسطة: @{requester_name}\n🏠 الغرفة: {source_room}\n"
-        f"🆔 {post_id}\n❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
+        f"🎵 جاري تشغيل الأغنية\n"
+        f"🎶 {title} — {artist}\n"
+        f"👤 الطلب بواسطة: @{requester_name}\n"
+        f"🏠 الغرفة: {source_room}\n"
+        f"🆔 {post_id}\n"
+        f"❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
     )
     targets = await all_room_ids()
     for target_rid in targets:
         try:
-            if card_url:
-                await room_send_media(target_rid, caption, card_url, m_type="image")
+            await room_send(target_rid, caption)
             duration_ms = int(float(track.get("duration") or 0) * 1000)
             await room_send_media(
                 target_rid,
-                f"▶️ تشغيل | {title}\n👤 @{requester_name}\n🏠 {source_room}",
+                f"▶️ تشغيل | {title}",
                 media_url, m_type="voice", duration_ms=duration_ms,
             )
         except Exception as exc:
             log.exception("music broadcast failed room=%s", target_rid)
-            await report_music_error_to_masters(target_rid, source_label, title, f"{type(exc).__name__}: {exc}", stage="إرسال الأغنية إلى الغرف")
+            await report_music_error_to_masters(
+                target_rid, source_label, title,
+                f"{type(exc).__name__}: {exc}",
+                stage="إرسال تفاصيل/رسالة الصوت إلى الغرف"
+            )
     return True, None
 
 def friendly_music_error(error):
@@ -1809,46 +1810,14 @@ async def _draw_game_text(draw, xy, text, font, fill=(30,30,30), anchor="ma"):
 
 
 def render_game_card_sync(game_key, title, lines):
+    """إنشاء صورة اللعبة فقط.
+
+    تفاصيل النتيجة لا تُرسم داخل الصورة؛ تُرسل كنص مستقل بعد الصورة حتى تبقى
+    صور الألعاب كما هي في مجلد assets، وبنفس الأسلوب الذي طلبه المستخدم.
+    """
     if not PIL_AVAILABLE:
         return None
-    # بطاقة حرب خاصة: سفينة مدمرة + اسم الفائز، بدلاً من إعادة صورة السفينة السليمة.
-    if game_key == "war":
-        outdir = BASE_DIR / "generated_games"
-        outdir.mkdir(exist_ok=True)
-        canvas = Image.new("RGB", (900, 860), (17, 21, 32))
-        d = ImageDraw.Draw(canvas)
-        font_path = BASE_DIR / "assets" / "Amiri-Bold.ttf"
-        try:
-            f_title = ImageFont.truetype(str(font_path), 48)
-            f_line = ImageFont.truetype(str(font_path), 32)
-        except Exception:
-            f_title = f_line = ImageFont.load_default()
-        # انفجار في منتصف البطاقة
-        cx, cy = 450, 300
-        for r, fill in [(155, (120,30,25)), (115, (190,70,25)), (75, (235,170,45)), (42, (255,230,150))]:
-            d.ellipse((cx-r, cy-r, cx+r, cy+r), fill=fill)
-        # سفينة مائلة ومدمرة
-        ship = [(240,430),(655,430),(590,500),(310,500)]
-        d.polygon(ship, fill=(135,145,160), outline=(235,240,245))
-        d.polygon([(330,430),(380,360),(445,430)], fill=(180,188,198))
-        d.polygon([(445,430),(505,345),(545,430)], fill=(160,168,180))
-        d.line((445,350,445,250), fill=(225,230,235), width=8)
-        d.polygon([(445,250),(520,275),(445,295)], fill=(205,45,45))
-        # شقوق الدمار
-        d.line((350,445,390,490), fill=(55,60,70), width=9)
-        d.line((470,440,530,490), fill=(55,60,70), width=9)
-        d.line((410,410,450,470), fill=(55,60,70), width=7)
-        _draw_game_text(d, (450, 75), title, f_title, fill=(255,255,255))
-        d.rounded_rectangle((55, 555, 845, 825), radius=28, fill=(255,255,255), outline=(215,218,223), width=3)
-        y=610
-        for line in lines[:4]:
-            _draw_game_text(d, (450, y), line, f_line, fill=(45,45,45))
-            y += 52
-        path = outdir / f"game_war_{uuid.uuid4().hex}.jpg"
-        canvas.save(path, quality=92, optimize=True)
-        return path
-    source = GAME_IMAGES.get(game_key)
-    # المصدر قد يكون رابطًا بعيدًا؛ نستخدم الصورة المحلية إن وجدت.
+
     local_map = {
         "slap": "assets/slap_action.jpg", "war": "assets/war_game.png",
         "fight": "assets/fight_action.jpg", "boxing": "assets/defense_action.jpg"
@@ -1857,6 +1826,7 @@ def render_game_card_sync(game_key, title, lines):
     src = BASE_DIR / local_map.get(game_key, f"assets/game_{game_key}.jpg")
     if generated.is_file() and game_key not in local_map:
         src = generated
+
     try:
         if src.is_file():
             im = Image.open(src).convert("RGB")
@@ -1864,23 +1834,11 @@ def render_game_card_sync(game_key, title, lines):
             im = Image.new("RGB", (900, 560), (240, 243, 247))
     except Exception:
         im = Image.new("RGB", (900, 560), (240, 243, 247))
-    im.thumbnail((900, 560), Image.LANCZOS)
-    canvas = Image.new("RGB", (900, 860), (245, 247, 250))
-    x = (900 - im.width)//2
-    canvas.paste(im, (x, 20))
-    d = ImageDraw.Draw(canvas)
-    font_path = BASE_DIR / "assets" / "Amiri-Bold.ttf"
-    try:
-        f_title = ImageFont.truetype(str(font_path), 46)
-        f_line = ImageFont.truetype(str(font_path), 34)
-    except Exception:
-        f_title = ImageFont.load_default(); f_line = f_title
-    d.rounded_rectangle((55, 610, 845, 825), radius=28, fill=(255,255,255), outline=(215,218,223), width=3)
-    _draw_game_text(d, (450, 650), title, f_title, fill=(45,45,45))
-    y=705
-    for line in lines[:3]:
-        _draw_game_text(d, (450, y), line, f_line, fill=(65,65,65))
-        y += 42
+
+    im.thumbnail((900, 700), Image.LANCZOS)
+    canvas = Image.new("RGB", (900, im.height), (245, 247, 250))
+    canvas.paste(im, ((900 - im.width) // 2, 0))
+
     outdir = BASE_DIR / "generated_games"
     outdir.mkdir(exist_ok=True)
     path = outdir / f"game_{game_key}_{uuid.uuid4().hex}.jpg"
@@ -1889,13 +1847,21 @@ def render_game_card_sync(game_key, title, lines):
 
 
 async def send_game_card(rid, game_key, title, lines, fallback_text=None):
+    """أرسل صورة اللعبة أولاً ثم تفاصيلها كنص مستقل."""
     path = await asyncio.to_thread(render_game_card_sync, game_key, title, lines)
     if path:
         try:
             url = await _store_media(path, "game", "image/jpeg")
-            await room_send_media(rid, title + "\n❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق", url, m_type="image")
-            try: path.unlink(missing_ok=True)
-            except Exception: pass
+            # الصورة وحدها: لا نضع اسم اللعبة أو النتيجة داخل الصورة.
+            await room_send_media(rid, "", url, m_type="image")
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            # التفاصيل بعد الصورة مباشرة، كنص قابل للقراءة والنسخ.
+            details = "\n".join(lines)
+            if details:
+                await room_send(rid, f"{title}\n{details}\n❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق")
             return
         except Exception as exc:
             log.warning("game card upload failed: %s", exc)
