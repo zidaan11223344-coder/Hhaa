@@ -1865,7 +1865,7 @@ async def render_music_card(track, requester_name, source_room):
     canvas.save(path, quality=92, optimize=True)
     return path
 
-async def play_track(rid, track, source_label, requester_id, requester_name):
+async def play_track(rid, track, source_label, requester_id, requester_name, local_only=False):
     if not track:
         return False, "لم أجد المقطع المطلوب"
     source_room = rooms.get(rid, "الغرفة")
@@ -1899,29 +1899,22 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
     code = _post_code()
     _POST_CODES[code] = post_id
 
-    # المطلوب: تفاصيل الأغنية كنص أولاً، ثم رسالة الصوت وحدها. لا صورة للأغنية.
-    # تصميم أنيق مع أزرار مرتبة مرتبطة بالكود المتغير.
+    # عرض الأغنية: نص بسيط بالمعلومات + رسالة صوتية (مثل صورة المستخدم)
+    # النص يظهر فوق/تحت الرسالة الصوتية في التطبيق.
     caption = (
-        f"✨════════════✨\n"
-        f"🎵 جاري تشغيل الأغنية\n"
-        f"🎶 {title} — {artist}\n"
-        f"👤 الطلب بواسطة: @{requester_name}\n"
-        f"🏠 الغرفة: {source_room}\n"
-        f"🆔 {code}\n"
-        f"❤️ إعجاب   👎 عدم إعجاب\n"
-        f"💖 أحببته   💬 تعليق\n"
-        f"✨════════════✨\n"
+        f"🎵 {title} — {artist}\n"
+        f"👤 @{requester_name} • 🏠 {source_room}\n"
         f"❤️ Like@{code} 👎 Dislike@{code}\n"
         f"💖 Love@{code} 💬 Comment@{code}"
     )
-    targets = await all_room_ids()
+    targets = [rid] if local_only else await all_room_ids()
     for target_rid in targets:
         try:
-            await room_send(target_rid, caption)
             duration_ms = int(float(track.get("duration") or 0) * 1000)
+            # إرسال الرسالة الصوتية أولاً (تظهر فوق)، ثم النص تحتها
             await room_send_media(
                 target_rid,
-                f"▶️ تشغيل | {title}",
+                caption,
                 media_url, m_type="voice", duration_ms=duration_ms,
             )
         except Exception as exc:
@@ -1958,7 +1951,11 @@ async def music_worker_queue():
     interval = max(0, int(C.get("music_interval_seconds", 0)))
     while True:
         item = await music_queue.get()
-        rid, query, source, requester_id, requester_name = item
+        if len(item) == 5:
+            rid, query, source, requester_id, requester_name = item
+            local_only = False
+        else:
+            rid, query, source, requester_id, requester_name, local_only = item
         try:
             wait = interval - (time.time() - last_music_started)
             if wait > 0:
@@ -1986,7 +1983,7 @@ async def music_worker_queue():
                 await room_send(rid, friendly_music_error(err))
                 await report_music_error_to_masters(rid, source, query, err, stage="البحث/الاتصال")
             else:
-                ok, out = await play_track(rid, track, used_source, requester_id, requester_name)
+                ok, out = await play_track(rid, track, used_source, requester_id, requester_name, local_only)
                 if not ok and out:
                     await room_send(rid, friendly_music_error(out))
                     await report_music_error_to_masters(rid, used_source, query, out, stage="التنزيل/التجهيز/الإرسال")
@@ -2188,6 +2185,45 @@ async def send_game_card(rid, game_key, title, lines, fallback_text=None):
         await room_send(rid, fallback_text)
 
 
+async def _war_board_message(rid, game, target_player_uid):
+    """إرسال لوحة الخصم (Opponent's Board) لمن عليه الدور."""
+    if not game or not game.get("p2"):
+        return
+    # اسم الخصم = الآخر
+    if target_player_uid == game["p1"]:
+        opponent_uid = game["p2"]
+        opponent_name = game["p2_name"]
+    else:
+        opponent_uid = game["p1"]
+        opponent_name = game["p1_name"]
+
+    # الأرقام 1..6 مع علامة ❌ على التي جربها اللاعب الحالي
+    tried = set(game["guesses"].get(str(target_player_uid), []))
+    board_cells = [f"❌{x}" if x in tried else str(x) for x in range(1, 7)]
+    board_line = " | ".join(board_cells)
+
+    skey = str(target_player_uid)
+    tries_used = game["tries"].get(skey, 0)
+    remaining = max(0, 3 - tries_used)
+
+    board_text = (
+        f"🎯 لوحة خصمك | Opponent's Board\n"
+        f"👤 @{opponent_name}\n"
+        f"━━━━━━━━━━━━━\n"
+        f"{board_line}\n"
+        f"━━━━━━━━━━━━━\n"
+        f"⚡ محاولاتك المتبقية: {remaining}\n"
+        f"🔢 اختر رقمًا (1-6)"
+    )
+    try:
+        # إرسال صورة الحرب ثم نص اللوحة
+        await room_send_media(rid, "", GAME_IMAGES["war"], m_type="image")
+        await room_send(rid, board_text)
+    except Exception as exc:
+        log.warning("war board message failed: %s", exc)
+        await room_send(rid, board_text)
+
+
 async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if await is_banned(rid, uid): return None
     p_name = await username_of(uid)
@@ -2209,14 +2245,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     if text.startswith("نشر ") or text.startswith("broadcast "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error: return vip_error
         msg = text.split(maxsplit=1)[1].strip()
         await broadcast_text("📢 " + msg)
         return "✅ تم نشر الرسالة في كل الغرف."
     if text.startswith("نشرصورة ") or text.startswith("broadcast_image "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error: return vip_error
         url = text.split(maxsplit=1)[1].strip()
         await broadcast_media("📢", url, m_type="image")
@@ -2228,7 +2264,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if lower_text.strip() in ("نشر@", "publish@") or text.startswith("نشر@ ") or text.startswith("publish@ "):
         if not await is_master(uid, p_name):
             return "🚫 للماستر فقط."
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error: return vip_error
         desc = ""
         base = lower_text.strip()
@@ -2464,21 +2500,31 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     # كل أوامر الألعاب محمية بتوثيق VIP من صاحب البوت.
     if cmd in GAME_COMMANDS:
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error:
             return vip_error
 
+    # sa: تشغيل الأغنية ونشرها لكل الغرف
+    if cmd == "sa":
+        vip_error = None
+        if vip_error: return vip_error
+        if not arg: return "❌ اكتب: sa اسم الأغنية"
+        cd = await require_music_cooldown()
+        if cd: return cd
+        await music_queue.put((rid, arg, "YouTube", uid, p_name, False))
+        return f"🎵 @{p_name} جاري تشغيل الأغنية ونشرها لكل الغرف…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
+
     if cmd in ("تشغيل", "play", "شغل"):
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error: return vip_error
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "YouTube", uid, p_name))
-        return f"🎵 @{p_name} جاري تنفيذ طلبك…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
+        await music_queue.put((rid, arg, "YouTube", uid, p_name, True))
+        return f"🎵 @{p_name} جاري تشغيل الأغنية في هذه الغرفة فقط…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("مشاركة", "share"):
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error: return vip_error
         current = music_state.get(rid)
         if not current:
@@ -2486,22 +2532,22 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 مشاركة الأغنية\n🎶 {current.get('title','المقطع')} — {current.get('artist','')}\n🔗 {current.get('spotify_url') or current.get('youtube_url') or ''}"
 
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error: return vip_error
         if not arg:
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "Spotify", uid, p_name))
+        await music_queue.put((rid, arg, "Spotify", uid, p_name, False))
         return f"🎵 @{p_name} جاري تنفيذ طلبك من Spotify…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
-        vip_error = None  # نسخة بدون توثيق
+        vip_error = None
         if vip_error: return vip_error
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "TikTok", uid, p_name))
+        await music_queue.put((rid, arg, "TikTok", uid, p_name, False))
         return f"🎵 @{p_name} جاري تنفيذ طلبك من TikTok…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     # لعبة الحرب: لاعبان، سفينة في 1..6، 3 محاولات لكل لاعب، مع انتهاء تلقائي.
@@ -2529,10 +2575,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                 "turn_started_at": now,
                 "expires_at": now + 90,
             }
-            await room_send_media(
+            await room_send(
                 rid,
-                f"⚔️ @{p_name} بدأ لعبة الحرب!\n⏳ جاري الانتظار: اكتب «حرب» للانضمام.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n⌛ تنتهي اللعبة تلقائياً إذا لم ينضم خصم.",
-                GAME_IMAGES["war"],
+                f"⚔️ @{p_name} بدأ لعبة الحرب!\n🔍 جاري البحث عن منافس…\n⏳ اكتب «حرب» للانضمام.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n⌛ تنتهي اللعبة تلقائياً إذا لم ينضم خصم."
             )
             return None
 
@@ -2546,11 +2591,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game["turn"] = game["p1"]
             game["turn_started_at"] = now
             game["expires_at"] = now + 120
-            await room_send_media(
-                rid,
-                f"⚔️ بدأت الحرب!\n👤 @{game['p1_name']} ضد @{p_name}\n🎯 دور @{game['p1_name']} — اكتب رقماً من 1 إلى 6.\n🔥 لكل لاعب 3 محاولات.\n⌛ المهلة دقيقتان لكل حركة.",
-                GAME_IMAGES["war"],
-            )
+            await _war_board_message(rid, game, game["p1"])
             return None
         return "⚠️ الحرب ممتلئة. انتظر انتهاء اللعبة."
 
@@ -2560,6 +2601,17 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if now >= game.get("expires_at", 0):
             war_games.pop(f"war_{rid}", None)
             return "⌛ انتهت الحرب بسبب انتهاء المهلة. اكتب «حرب» لبدء لعبة جديدة."
+
+        if text.strip().lower() in ("رادار", "radar"):
+            if game.get("p2") is None:
+                return "⏳ انتظر اللاعب الثاني."
+            if uid not in (game["p1"], game["p2"]):
+                return "🚫 هذه اللعبة بين لاعبين آخرين."
+            skey = str(uid)
+            tried = set(game["guesses"].get(skey, []))
+            available = sorted(set(range(1, 7)) - tried)
+            await room_send(rid, f"🛰️ Radar | الرادار\n🚢 السفينة في أحد هذه الأرقام:\n{' '.join(str(x) for x in available)}")
+            return None
 
         if text.isdigit() and 1 <= int(text) <= 6:
             if game.get("p2") is None:
@@ -2579,6 +2631,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
             if n == game["ship"]:
                 add_points(uid, p_name, 5000)
+                other = game["p2"] if uid == game["p1"] else game["p1"]
                 await send_game_card(rid, "war", "⚔️ حرب | Battle", [f"🏆 Winner | الفائز: @{p_name} (+{fmt_pts(5000)})", f"💥 🚢 السفينة دُمّرت بواسطة @{p_name}", f"🚢 موقع السفينة: {game['ship']}", f"🎁 الجائزة: +{fmt_pts(5000)} نقطة"], f"💥🚢 تم تدمير السفينة! الفائز @{p_name} (+{fmt_pts(5000)} نقطة)")
                 war_games.pop(f"war_{rid}", None)
                 return None
@@ -2593,7 +2646,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                 war_games.pop(f"war_{rid}", None)
                 return None
 
-            # إذا كان الخصم استنفد محاولاته، لا نعطيه الدور؛ يستمر اللاعب الحالي.
             if other_tries >= 3:
                 game["turn"] = uid
                 next_name = p_name
@@ -2607,9 +2659,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game["expires_at"] = now + 120
             await room_send(
                 rid,
-                f"❌ الرقم {n} ليس السفينة.\n🔄 دور @{next_name} — بقيت له {remaining} محاولات."
+                f"👤 @{p_name} ❌ الرقم {n} ليس السفينة | Missed\n🔄 دور @{next_name} — بقيت له {remaining} محاولات."
             )
+            await _war_board_message(rid, game, game["turn"])
             return None
+
+        if uid in (game.get("p1"), game.get("p2")):
+            return "⚠️ اكتب رقماً من 1 إلى 6 للتخمين، أو «رادار» لتلميح."
+        return None
 
     if cmd in ("سرقة", "rob"):
         cd_error = await require_game_cooldown(cmd)
@@ -2807,6 +2864,188 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     
     return None
 
+async def run_cleanup():
+    """تنظيف فوري للمخلفات عند طلب الماستر من الخاص."""
+    try:
+        files_deleted = 0
+        dirs_cleaned = 0
+        now = time.time()
+        if GIFT_RENDER_DIR.exists():
+            for fp in GIFT_RENDER_DIR.glob("gift_*.png"):
+                try:
+                    if now - fp.stat().st_mtime > 300:
+                        fp.unlink(); files_deleted += 1
+                except OSError:
+                    pass
+            dirs_cleaned += 1
+        if PUBLISH_LOCAL_DIR.exists():
+            for fp in PUBLISH_LOCAL_DIR.glob("*.*"):
+                try:
+                    if now - fp.stat().st_mtime > 600:
+                        fp.unlink(); files_deleted += 1
+                except OSError:
+                    pass
+            dirs_cleaned += 1
+        try:
+            for fp in Path(tempfile.gettempdir()).glob("alsfer_*.*"):
+                try:
+                    if now - fp.stat().st_mtime > 600:
+                        fp.unlink(); files_deleted += 1
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        # حذف المنشورات المنتهية
+        posts = load_published_posts()
+        removed = _prune_expired_posts(posts)
+        if removed:
+            save_published_posts(posts)
+        return {"files_deleted": files_deleted, "dirs_cleaned": dirs_cleaned}
+    except Exception:
+        log.exception("manual cleanup failed")
+        return "فشل التنظيف"
+
+
+async def create_backup_and_send(sender_uid):
+    """إنشاء نسخة احتياطية ZIP بكل ملفات البوت وإرسالها في خاص الماستر."""
+    try:
+        bot_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        backup_name = f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        backup_path = Path(tempfile.gettempdir()) / backup_name
+
+        import zipfile
+        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # إضافة ملفات البوت الرئيسية
+            for pattern in ["bot_vip.py", "bot_no_vip.py", "bot.py", "cleanup.py",
+                           "config.json", "points.json", "published_posts.json",
+                           "vip_users.json", "bans.json", "masters.json",
+                           "rooms_saved.json", "spotify_cookies.txt",
+                           "youtube_cookies.txt"]:
+                fp = bot_dir / pattern
+                if fp.exists():
+                    zf.write(fp, pattern)
+
+            # إضافة مجلدات (assets, generated_gifts, logs) إذا وجدت
+            for dir_name in ["assets", "generated_gifts", "logs", "media_cache"]:
+                d = bot_dir / dir_name
+                if d.exists():
+                    for f in d.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f"{dir_name}/{f.relative_to(d)}")
+
+        size_mb = backup_path.stat().st_size / (1024 * 1024)
+        await dm_send(sender_uid, f"📦 النسخة الاحتياطية جاهزة:\n📄 الاسم: {backup_name}\n📏 الحجم: {size_mb:.1f} MB\n\n⚠️ الملف كبير — أرسلته كملف ZIP في خاصك.\nاحفظه فورًا.")
+
+        # إرسال الملف كـ attachment
+        try:
+            url = await _store_media(backup_path, "backup", "application/zip")
+            await room_send_media(str(sender_uid), "📦 نسخة احتياطية للبوت", url, m_type="file")
+        except Exception:
+            log.exception("failed to send backup file, sending as text")
+            # إذا فشل إرسال الملف، أرسل المحتوى كرسائل نصية مقسمة
+            with open(backup_path, 'rb') as f:
+                content = f.read().decode('utf-8', errors='ignore')
+            chunk_size = 3000
+            for i in range(0, len(content), chunk_size):
+                chunk = content[i:i+chunk_size]
+                await dm_send(sender_uid, chunk)
+
+        backup_path.unlink(missing_ok=True)
+        return "✅ تم إرسال النسخة الاحتياطية في خاصك."
+    except Exception as exc:
+        log.exception("backup creation failed")
+        return f"❌ فشل إنشاء النسخة الاحتياطية: {exc}"
+
+
+async def delete_old_backups():
+    """حذف النسخ الاحتياطية السابقة المحفوظة في مجلد /tmp."""
+    try:
+        deleted = 0
+        temp_dir = Path(tempfile.gettempdir())
+        for fp in temp_dir.glob("bot_backup_*.zip"):
+            try:
+                fp.unlink()
+                deleted += 1
+            except OSError:
+                pass
+        return f"✅ تم حذف {deleted} نسخة احتياطية سابقة."
+    except Exception:
+        log.exception("delete old backups failed")
+        return "❌ فشل حذف النسخ الاحتياطية."
+
+
+async def send_backup_via_telegram(sender_uid):
+    """إرسال النسخة الاحتياطية عبر تلجرام باستخدام TELEGRAM_BOT_TOKEN."""
+    try:
+        tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if not tg_token:
+            return "❌ لا يوجد TELEGRAM_BOT_TOKEN — أضفه في متغيرات Railway أولاً."
+
+        bot_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        backup_name = f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        backup_path = Path(tempfile.gettempdir()) / backup_name
+
+        import zipfile
+        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for pattern in ["bot_vip.py", "bot_no_vip.py", "bot.py", "cleanup.py",
+                           "config.json", "points.json", "published_posts.json",
+                           "vip_users.json", "bans.json", "masters.json",
+                           "rooms_saved.json", "spotify_cookies.txt",
+                           "youtube_cookies.txt"]:
+                fp = bot_dir / pattern
+                if fp.exists():
+                    zf.write(fp, pattern)
+
+            for dir_name in ["assets", "generated_gifts", "logs", "media_cache"]:
+                d = bot_dir / dir_name
+                if d.exists():
+                    for f in d.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f"{dir_name}/{f.relative_to(d)}")
+
+        size_mb = backup_path.stat().st_size / (1024 * 1024)
+        if size_mb > 50:
+            backup_path.unlink(missing_ok=True)
+            return f"❌ النسخة كبيرة ({size_mb:.0f} MB) — تلجرام يقبل 50 MB كحد أقصى. جرب: تنظيف ثم backup"
+
+        # إرسال الملف عبر Telegram Bot API (sendDocument)
+        async with aiohttp.ClientSession() as session:
+            # أولاً نرسل رسالة للماستر على تلجرام ليحصل على chat_id
+            get_updates_url = f"https://api.telegram.org/bot{tg_token}/getUpdates"
+            async with session.get(get_updates_url) as resp:
+                data = await resp.json()
+            
+            chat_id = None
+            if data.get("ok") and data.get("result"):
+                for update in data["result"]:
+                    msg = update.get("message")
+                    if msg and msg.get("chat", {}).get("type") == "private":
+                        chat_id = msg["chat"]["id"]
+                        break
+
+            if not chat_id:
+                backup_path.unlink(missing_ok=True)
+                return "❌ لم أجد محادثة سابقة مع البوت على تلجرام. أرسل رسالة لبوت تلجرام أولاً ثم اكتب تلجرام هنا."
+
+            # إرسال الملف
+            url = f"https://api.telegram.org/bot{tg_token}/sendDocument"
+            with open(backup_path, 'rb') as f:
+                form_data = aiohttp.FormData()
+                form_data.add_field('chat_id', str(chat_id))
+                form_data.add_field('document', f, filename=backup_name)
+                async with session.post(url, data=form_data) as resp:
+                    result = await resp.json()
+
+            backup_path.unlink(missing_ok=True)
+            if result.get("ok"):
+                return f"✅ تم إرسال النسخة الاحتياطية ({size_mb:.1f} MB) على تلجرام."
+            else:
+                return f"❌ فشل إرسال تلجرام: {result.get('description', 'unknown error')}"
+    except Exception as exc:
+        log.exception("telegram backup failed")
+        return f"❌ فشل إرسال تلجرام: {exc}"
+
+
 # ----------------------------- الحلقات -----------------------------
 async def dm_loop():
     while True:
@@ -2826,6 +3065,17 @@ async def dm_loop():
                         ok, m = await leave(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("غرفي", "rooms"):
                         reply = "🏠 " + (", ".join(rooms.values()) if rooms else "لا توجد غرف")
+                    elif cmd in ("تنظيف", "clean") and is_owner:
+                        cleaned = await run_cleanup()
+                        reply = f"✅ تم التنظيف:\n🗑️ {cleaned['files_deleted']} ملف محذوف\n📦 تم إفراغ {cleaned['dirs_cleaned']} مجلد" if isinstance(cleaned, dict) else f"✅ {cleaned}"
+                    elif cmd in ("نسخة احتياطية", "backup") and is_owner:
+                        reply = await create_backup_and_send(sender)
+                    elif cmd in ("حفظ", "save") and is_owner:
+                        reply = await create_backup_and_send(sender)
+                    elif cmd in ("حذف نسخ", "حذف النسخ", "clear_backups", "delete_backups") and is_owner:
+                        reply = await delete_old_backups()
+                    elif cmd in ("تلغرام", "تلجرام", "telegram_backup") and is_owner:
+                        reply = await send_backup_via_telegram(sender)
                     if reply: await dm_send(sender, reply)
                 await run(lambda i=row["id"]: sb.table("dm_relay").delete().eq("id", i).execute())
         except Exception:
