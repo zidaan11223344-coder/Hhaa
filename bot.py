@@ -210,10 +210,11 @@ def yt_base_options(source_label="YouTube"):
     if source_label == "YouTube":
         # YouTube في 2026 يفرض PO Tokens على بعض عملاء GVS.
         # لا نستخدم mweb افتراضياً لأنه أكثر عرضة لـ403 بدون PO Token.
-        clients = str(os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "default,web_embedded,tv,tvos")).strip()
+        # يجرّب البوت كل العملاء الممكنة تلقائيًا لتجاوز حظر يوتيوب.
+        clients = str(os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "default,web_embedded,tv,tvos,web,mweb,android_vr")).strip()
         client_list = [x.strip() for x in clients.split(",") if x.strip()]
         if not client_list:
-            client_list = ["default", "web_embedded", "tv", "tvos"]
+            client_list = ["default", "web_embedded", "tv", "tvos", "web", "mweb", "android_vr"]
         if has_youtube_cookies():
             options["cookiefile"] = YOUTUBE_COOKIES_PATH
         ex = {"youtube": {"player_client": client_list}}
@@ -1160,10 +1161,10 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
                 # محاولة 1: بدون cookies مع default+web_embedded (يتجنب مشكلة بعض الجلسات المسجلة).
                 for idx, fmt in enumerate(formats):
                     attempts.append((idx, fmt, False, ["default", "web_embedded"]))
-                # محاولة 2: بدون cookies مع tv/tvos (عملاء يوتيوب TV لا يحتاجون PO Token عادة).
+                # محاولة 2: بدون cookies مع tv/tvos/android_vr (عملاء يوتيوب TV/VR لا يحتاجون PO Token عادة).
                 base2 = len(attempts)
                 for j, fmt in enumerate(formats):
-                    attempts.append((base2 + j, fmt, False, ["tv", "tvos", "web_embedded"]))
+                    attempts.append((base2 + j, fmt, False, ["tv", "tvos", "android_vr"]))
                 # محاولة 3: cookies صحيحة مع default+web_embedded+tv.
                 if has_youtube_cookies():
                     base = len(attempts)
