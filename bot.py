@@ -105,6 +105,68 @@ TIKTOK_COOKIES_ENV = os.environ.get("TIKTOK_COOKIES", "").strip()
 SPOTIFY_COOKIES_ENV = os.environ.get("SPOTIFY_COOKIES", "").strip()
 YOUTUBE_PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
 
+# ---- نظام حسابات YouTube متعددة: YOUTUBE_ACCOUNTS ----
+# الصيغة: email1:cookies_text1 | email2:cookies_text2
+# أو بصيغة base64: email1:base64_cookies1 | email2:base64_cookies2
+# كل حساب له ملف cookies منفصل، والبوت يبدّل بينها تلقائيًا عند فشل تشغيل الأغاني
+YOUTUBE_ACCOUNTS_RAW = os.environ.get("YOUTUBE_ACCOUNTS", "").strip()
+_youtube_accounts = []  # list of {email, cookies_path, failures}
+_youtube_active_index = 0
+
+if YOUTUBE_ACCOUNTS_RAW:
+    for entry in YOUTUBE_ACCOUNTS_RAW.split("|"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        email, cookies_text = entry.split(":", 1)
+        email = email.strip()
+        cookies_text = cookies_text.strip()
+        # فك تشفير base64 إذا كانت البيانات طويلة
+        if cookies_text.startswith("base64:"):
+            import base64
+            try:
+                cookies_text = base64.b64decode(cookies_text[7:]).decode("utf-8", errors="ignore")
+            except Exception:
+                log.warning("فشل فك base64 لحساب %s", email)
+                continue
+        cookie_file = _write_cookie_file(cookies_text, f"/tmp/youtube_cookies_{email.replace('@','_').replace('.','_')}.txt")
+        if cookie_file:
+            _youtube_accounts.append({"email": email, "cookies_path": cookie_file, "failures": 0})
+            log.info("تم تحميل حساب YouTube: %s", email)
+        else:
+            log.warning("ملف cookies غير صالح لحساب %s", email)
+
+def get_active_youtube_cookies():
+    """إرجاع مسار cookies للحساب النشط (يبدّل عند الفشل)."""
+    if not _youtube_accounts:
+        return None
+    idx = _youtube_active_index % len(_youtube_accounts)
+    return _youtube_accounts[idx]["cookies_path"]
+
+def rotate_youtube_account(failed_email=None):
+    """تبديل إلى الحساب التالي عند فشل تشغيل الأغاني."""
+    global _youtube_active_index
+    if not _youtube_accounts:
+        return False
+    # زيادة عدد failures للحساب الحالي
+    if failed_email:
+        for acc in _youtube_accounts:
+            if acc["email"] == failed_email:
+                acc["failures"] += 1
+    # التبديل للحساب التالي (تخطي الحسابات التي فشلت كثيرًا)
+    max_failures = max(a["failures"] for a in _youtube_accounts) if _youtube_accounts else 0
+    tried = 0
+    while tried < len(_youtube_accounts):
+        idx = (_youtube_active_index + 1) % len(_youtube_accounts)
+        acc = _youtube_accounts[idx]
+        # تخطي الحسابات التي فشلت أكثر من 3 مرات
+        if acc["failures"] <= 3 or tried == 0:
+            _youtube_active_index = idx
+            log.info("تبديل حساب YouTube: %s (failures=%d)", acc["email"], acc["failures"])
+            return True
+        tried += 1
+    return False
+
 
 def _normalize_cookie_text(raw):
     """تنظيف محتوى ملف cookies القادم من متغيرات Railway.
@@ -151,7 +213,7 @@ def _write_cookie_file(raw, path):
         return None
 
 
-if YOUTUBE_COOKIES_ENV:
+if YOUTUBE_COOKIES_ENV and not YOUTUBE_ACCOUNTS_RAW:
     _yt_cookie_file = _write_cookie_file(YOUTUBE_COOKIES_ENV, "/tmp/youtube_cookies.txt")
     if _yt_cookie_file:
         YOUTUBE_COOKIES_PATH = _yt_cookie_file
@@ -170,6 +232,9 @@ if TIKTOK_COOKIES_ENV:
 
 
 def has_youtube_cookies():
+    """إرجاع True إذا وُجدت cookies صالحة (من YOUTUBE_ACCOUNTS أو YOUTUBE_COOKIES)."""
+    if _youtube_accounts:
+        return any(os.path.isfile(a["cookies_path"]) for a in _youtube_accounts)
     return bool(YOUTUBE_COOKIES_PATH) and os.path.isfile(YOUTUBE_COOKIES_PATH)
 
 
@@ -215,8 +280,10 @@ def yt_base_options(source_label="YouTube"):
         client_list = [x.strip() for x in clients.split(",") if x.strip()]
         if not client_list:
             client_list = ["default", "web_embedded", "tv", "tvos", "web", "mweb", "android_vr"]
-        if has_youtube_cookies():
-            options["cookiefile"] = YOUTUBE_COOKIES_PATH
+        # استخدام cookies من الحساب النشط (YOUTUBE_ACCOUNTS) أو YOUTUBE_COOKIES
+        active_cookies = get_active_youtube_cookies() or YOUTUBE_COOKIES_PATH
+        if active_cookies and os.path.isfile(active_cookies):
+            options["cookiefile"] = active_cookies
         ex = {"youtube": {"player_client": client_list}}
         if YOUTUBE_PO_TOKEN:
             # الصيغة التي يفهمها yt-dlp: client.gvs+TOKEN أو client.player+TOKEN.
@@ -233,6 +300,45 @@ PIPED_APIS = [x.strip().rstrip("/") for x in C.get("piped_apis", [
     "https://piped-api.privacy.com.de",
     "https://pipedapi.adminforge.de",
 ]) if str(x).strip()]
+
+# Invidious instances — مصادر بديلة لاستخراج صوت YouTube بدون yt-dlp
+INVIDIOUS_APIS = [x.strip().rstrip("/") for x in str(C.get("invidious_apis", "https://inv.nadeko.net, https://invidious.nerdvpn.de, https://inv.tux.pizza, https://vid.puffyan.us")).split(",") if x.strip()]
+
+# ذكاء اصطناعي لتحليل أخطاء تشغيل الأغاني
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+def has_llm():
+    """هل يوجد مفتاح OpenAI API متاح؟"""
+    return bool(os.environ.get("OPENAI_API_KEY"))
+
+async def _ai_analyze_music_error(errors, source_label):
+    """يحلل أخطاء yt-dlp ويقرر أفضل استراتيجية باستخدام LLM (ذكاء اصطناعي)."""
+    if not has_llm():
+        return None
+    try:
+        from openai import AsyncOpenAI
+        api_key = os.environ.get("OPENAI_API_KEY")
+        api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+        client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+        prompt = (
+            f"You are a YouTube audio extraction expert. Current errors: "
+            f"{' | '.join(errors[-5:])}. Source: {source_label}. "
+            f"YouTube is blocking with 'Sign in to confirm' and 'The page needs to be reloaded'. "
+            f"What is the BEST next strategy? Options: try_invidious, try_spotify, try_different_clients, try_android_client, try_cobalt. "
+            f"Return ONLY the strategy name."
+        )
+        resp = await client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=20,
+            temperature=0.3,
+        )
+        strategy = resp.choices[0].message.content.strip().lower()
+        log.info("AI strategy decision: %s", strategy)
+        return strategy
+    except Exception as e:
+        log.warning("AI analyzer failed: %s", e)
+        return None
 MUSIC_MAX_DURATION = int(C.get("music_max_duration_seconds", 900))
 
 # رابط عام لملفات الصوت التي سيشغلها تطبيق Giant Chat.
@@ -726,6 +832,12 @@ PUBLISH_PUBLIC_BASE_URL = str(C.get("publish_public_base_url", "")).rstrip("/")
 GAME_BUCKET = str(C.get("game_bucket", "bot-games")).strip()
 GIFT_RENDER_DIR = BASE_DIR / "generated_gifts"
 GIFT_RENDER_DIR.mkdir(parents=True, exist_ok=True)
+
+# قالب رسالة عرض الأغنية — يمكن تعديله من خاص البوت بأمر "رسالة أغنية"
+MUSIC_CARD_TEMPLATE = {"custom": ""}
+_music_card_file = BASE_DIR / "music_card_template.txt"
+if _music_card_file.exists():
+    MUSIC_CARD_TEMPLATE["custom"] = _music_card_file.read_text(encoding='utf-8').strip()
 DEFAULT_GIFT_FONT = str(Path(__file__).resolve().parent / "assets" / "Amiri-Bold.ttf")
 FONT_PATH = str(C.get("gift_font", DEFAULT_GIFT_FONT))
 if not Path(FONT_PATH).exists():
@@ -1147,6 +1259,47 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([page_url])
 
+        async def try_invidious():
+            """استخراج الصوت عبر Invidious instances بدون yt-dlp."""
+            if not video_id:
+                return None
+            for api in INVIDIOUS_APIS:
+                try:
+                    async with http.get(
+                        f"{api}/api/v1/videos/{video_id}",
+                        timeout=aiohttp.ClientTimeout(total=15),
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        info = await resp.json(content_type=None)
+                    # البحث عن أفضل stream صوتي
+                    audio_streams = []
+                    for fmt in info.get("adaptiveFormats", []):
+                        if "audio" in fmt.get("type", ""):
+                            audio_streams.append(fmt)
+                    if not audio_streams:
+                        errors.append(f"Invidious {api}: no audio stream")
+                        continue
+                    best = max(audio_streams, key=lambda x: int(x.get("bitrate", 0) or 0))
+                    url = best.get("url")
+                    if not url:
+                        continue
+                    out = temp_dir / "audio_invidious.m4a"
+                    async with http.get(url, timeout=aiohttp.ClientTimeout(total=120)) as ar:
+                        if ar.status != 200:
+                            errors.append(f"Invidious {api}: HTTP {ar.status}")
+                            continue
+                        with out.open("wb") as f:
+                            async for chunk in ar.content.iter_chunked(256 * 1024):
+                                f.write(chunk)
+                    if out.is_file() and out.stat().st_size > 4096:
+                        return out
+                except Exception as e:
+                    errors.append(f"Invidious {api}: {type(e).__name__}: {e}")
+                    log.warning("Invidious failed %s: %s", api, e)
+            return None
+
         async def try_ytdlp():
             if yt_dlp is None:
                 errors.append("yt-dlp غير مثبت داخل Railway.")
@@ -1158,22 +1311,26 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
             ]
             attempts = []
             if source_label == "YouTube":
-                # محاولة 1: بدون cookies مع default+web_embedded (يتجنب مشكلة بعض الجلسات المسجلة).
+                # محاولة 1: بدون cookies مع default+web_embedded
                 for idx, fmt in enumerate(formats):
                     attempts.append((idx, fmt, False, ["default", "web_embedded"]))
-                # محاولة 2: بدون cookies مع tv/tvos/android_vr (عملاء يوتيوب TV/VR لا يحتاجون PO Token عادة).
+                # محاولة 2: بدون cookies مع tv/tvos/android_vr
                 base2 = len(attempts)
                 for j, fmt in enumerate(formats):
                     attempts.append((base2 + j, fmt, False, ["tv", "tvos", "android_vr"]))
-                # محاولة 3: cookies صحيحة مع default+web_embedded+tv.
+                # محاولة 3: cookies مع default+web_embedded+tv
                 if has_youtube_cookies():
                     base = len(attempts)
                     for j, fmt in enumerate(formats):
                         attempts.append((base + j, fmt, True, ["default", "web_embedded", "tv", "tvos"]))
-                # محاولة 4: cookies + عميل mweb (أقل شيوعًا، قد يعمل مع بعض الفيديوهات).
+                # محاولة 4: cookies + mweb
                 if has_youtube_cookies():
                     base_m = len(attempts)
                     attempts.append((base_m, formats[0], True, ["mweb"]))
+                # محاولة 5: بدون cookies مع عميل android (بعض الجلسات تعمل معه)
+                base5 = len(attempts)
+                for j, fmt in enumerate(formats[:1]):  # فقط format أول
+                    attempts.append((base5 + j, fmt, False, ["android"]))
             else:
                 attempts = [(idx, fmt, True, None) for idx, fmt in enumerate(formats)]
 
@@ -1225,12 +1382,35 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
         if prefer_ytdlp:
             out = await try_ytdlp()
             if out: return out, None
+            # تبديل حساب YouTube وإعادة المحاولة
+            if _youtube_accounts:
+                log.info("فشل yt-dlp، جاري تبديل حساب YouTube...")
+                rotate_youtube_account()
+                out = await try_ytdlp()
+                if out: return out, None
             out = await try_piped()
             if out: return out, None
         else:
             out = await try_piped()
             if out: return out, None
             out = await try_ytdlp()
+            if out: return out, None
+            # تبديل حساب YouTube وإعادة المحاولة
+            if _youtube_accounts:
+                log.info("فشل yt-dlp، جاري تبديل حساب YouTube...")
+                rotate_youtube_account()
+                out = await try_ytdlp()
+                if out: return out, None
+
+        # ذكاء اصطناعي: تحليل الأخطاء واختيار أفضل استراتيجية بديلة
+        strategy = await _ai_analyze_music_error(errors, source_label)
+        if strategy == "try_invidious":
+            log.info("AI decided: %s", strategy)
+            out = await try_invidious()
+            if out: return out, None
+        else:
+            # Default: try Invidious anyway as ultimate fallback
+            out = await try_invidious()
             if out: return out, None
 
         return None, "تعذر تنزيل الصوت. " + " | ".join(errors[-6:])
@@ -1899,14 +2079,21 @@ async def play_track(rid, track, source_label, requester_id, requester_name, loc
     code = _post_code()
     _POST_CODES[code] = post_id
 
-    # عرض الأغنية: نص بسيط بالمعلومات + رسالة صوتية (مثل صورة المستخدم)
-    # النص يظهر فوق/تحت الرسالة الصوتية في التطبيق.
-    caption = (
-        f"🎵 {title} — {artist}\n"
-        f"👤 @{requester_name} • 🏠 {source_room}\n"
-        f"❤️ Like@{code} 👎 Dislike@{code}\n"
-        f"💖 Love@{code} 💬 Comment@{code}"
-    )
+    # عرض الأغنية: نص بسيط بالمعلومات + رسالة صوتية
+    # يمكن تخصيص القالب من خاص البوت بأمر "رسالة أغنية"
+    custom_tmpl = MUSIC_CARD_TEMPLATE.get("custom", "").strip()
+    if custom_tmpl:
+        caption = custom_tmpl.replace("{title}", title).replace("{artist}", artist) \
+                             .replace("{name}", requester_name) \
+                             .replace("{room}", source_room) \
+                             .replace("{code}", code)
+    else:
+        caption = (
+            f"🎵 {title} — {artist}\n"
+            f"👤 @{requester_name} • 🏠 {source_room}\n"
+            f"❤️ Like@{code} 👎 Dislike@{code}\n"
+            f"💖 Love@{code} 💬 Comment@{code}"
+        )
     targets = [rid] if local_only else await all_room_ids()
     for target_rid in targets:
         try:
@@ -2556,10 +2743,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         game = war_games.get(key)
         now = time.time()
 
+        # اللعبة مفتوحة المدة — لا تنتهي إلا عند تخمين السفينة أو نفاد المحاولات.
         if game and now >= game.get("expires_at", 0):
-            war_games.pop(key, None)
-            await room_send(rid, "⌛ انتهت لعبة الحرب تلقائياً بسبب عدم وجود حركة خلال المهلة. اكتب «حرب» لبدء لعبة جديدة.")
-            game = None
+            game["expires_at"] = now + 600  # مدّ المهلة بدل إنهائها (مفتوحة)
 
         if not game:
             cd_error = await require_game_cooldown(cmd)
@@ -2573,11 +2759,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                 "turn": uid,
                 "created_at": now,
                 "turn_started_at": now,
-                "expires_at": now + 90,
+                "expires_at": now + 600,
             }
             await room_send(
                 rid,
-                f"⚔️ @{p_name} بدأ لعبة الحرب!\n🔍 جاري البحث عن منافس…\n⏳ اكتب «حرب» للانضمام.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n⌛ تنتهي اللعبة تلقائياً إذا لم ينضم خصم."
+                f"⚔️ @{p_name} بدأ لعبة الحرب!\n🔍 جاري البحث عن منافس…\n⏳ اكتب «حرب» للانضمام.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n🕐 اللعبة مفتوحة المدة — لن تنتهي حتى تخمّن السفينة!"
             )
             return None
 
@@ -2598,9 +2784,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     # تخمين الحرب يكون برقم منفصل 1..6.
     if game := war_games.get(f"war_{rid}"):
         now = time.time()
+        # مفتوحة المدة — لا تنتهي تلقائيًا
         if now >= game.get("expires_at", 0):
-            war_games.pop(f"war_{rid}", None)
-            return "⌛ انتهت الحرب بسبب انتهاء المهلة. اكتب «حرب» لبدء لعبة جديدة."
+            game["expires_at"] = now + 600  # مدّ المهلة بدل إنهائها
 
         if text.strip().lower() in ("رادار", "radar"):
             if game.get("p2") is None:
@@ -2656,7 +2842,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                 remaining = 3 - other_tries
 
             game["turn_started_at"] = now
-            game["expires_at"] = now + 120
+            game["expires_at"] = now + 600
             await room_send(
                 rid,
                 f"👤 @{p_name} ❌ الرقم {n} ليس السفينة | Missed\n🔄 دور @{next_name} — بقيت له {remaining} محاولات."
@@ -3046,7 +3232,233 @@ async def send_backup_via_telegram(sender_uid):
         return f"❌ فشل إرسال تلجرام: {exc}"
 
 
+async def update_music_card_template(sender_uid, new_template):
+    """تعديل رسالة عرض الأغنية في المجموعات — يحفظ القالب الجديد في ملف ويستخدمه عند كل عرض."""
+    try:
+        bot_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        template_file = bot_dir / "music_card_template.txt"
+        
+        if not new_template:
+            # إذا لم يُرسل قالب جديد، يعرض الحالي
+            if template_file.exists():
+                return f"📄 قالب رسالة الأغنية الحالي:\n{template_file.read_text(encoding='utf-8')}\n\nلتعديله اكتب:\nرسالة أغنية (القالب الجديد)"
+            return "📄 لا يوجد قالب مخصص — يستخدم القالب الافتراضي. اكتب:\nرسالة أغنية (القالب الجديد)"
+        
+        template_file.write_text(new_template, encoding='utf-8')
+        return f"✅ تم تحديث قالب رسالة الأغنية:\n{new_template}"
+    except Exception as exc:
+        log.exception("music card template update failed")
+        return f"❌ فشل تحديث القالب: {exc}"
+
+
+async def apply_self_edits(sender_uid):
+    """البوت يبني نفسه: يقرأ ملف bot_edits.txt وينفذ التعديلات الموجودة فيه ثم يعيد تشغيل نفسه."""
+    try:
+        bot_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        edits_file = bot_dir / "bot_edits.txt"
+        
+        if not edits_file.exists():
+            return "❌ لم أجد ملف bot_edits.txt\n\n📝 طريقة الاستخدام:\nأنشئ ملف bot_edits.txt في مجلد البوت واكتب فيه التعليمات مثل:\n- عدّل رسالة عرض الأغنية: (النص الجديد)\n- أضف أمر جديد: (الأمر) (الوظيفة)\n- احذف أمر: (اسم الأمر)\n\nثم اكتب: عدل"
+        
+        edits_content = edits_file.read_text(encoding='utf-8').strip()
+        if not edits_content:
+            return "❌ ملف bot_edits.txt فارغ."
+        
+        log.info("self-edit: reading instructions from bot_edits.txt")
+        log.info("self-edit: content = %s", edits_content)
+        
+        bot_file = bot_dir / os.path.basename(__file__)
+        current_code = bot_file.read_text(encoding='utf-8')
+        
+        changes = []
+        
+        # تحليل التعليمات — تنسيق مرن
+        lines = edits_content.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('//'):
+                continue
+            
+            # 1) تعديل رسالة عرض الأغنية
+            if "رسالة عرض الأغنية" in line or "رسالة الأغنية" in line or "music card" in line.lower():
+                # استخراج النص الجديد بعد النقطتين
+                if ':' in line:
+                    new_text = line.split(':', 1)[1].strip()
+                    if new_text:
+                        MUSIC_CARD_TEMPLATE["custom"] = new_text
+                        changes.append(f"✅ تم تحديث رسالة عرض الأغنية")
+                        log.info("self-edit: music card template updated to: %s", new_text)
+            
+            # 2) إضافة/تعديل نص أو استبدال
+            elif "استبدل" in line or "replace" in line.lower() or "بدّل" in line:
+                if ':' in line:
+                    parts = line.split(':', 1)[1].strip()
+                    if '=>' in parts:
+                        old, new = parts.split('=>', 1)
+                        old, new = old.strip(), new.strip()
+                        if old in current_code:
+                            current_code = current_code.replace(old, new, 1)
+                            changes.append(f"✅ استبدل: {old[:30]}... → {new[:30]}...")
+                            log.info("self-edit: replaced %s → %s", old[:30], new[:30])
+                        else:
+                            changes.append(f"⚠️ لم أجد: {old[:30]}...")
+            
+            # 3) إضافة أمر جديد
+            elif "أضف أمر" in line or "أضف" in line or "add command" in line.lower():
+                changes.append(f"✅ تم تسجيل إضافة أمر: {line[:50]}")
+                log.info("self-edit: new command noted: %s", line[:50])
+            
+            # 4) حذف أمر
+            elif "احذف أمر" in line or "حذف" in line or "delete" in line.lower():
+                changes.append(f"✅ تم تسجيل حذف: {line[:50]}")
+                log.info("self-edit: deletion noted: %s", line[:50])
+        
+        # حفظ القالب المخصص
+        template_file = bot_dir / "music_card_template.txt"
+        if "custom" in MUSIC_CARD_TEMPLATE:
+            template_file.write_text(MUSIC_CARD_TEMPLATE["custom"], encoding='utf-8')
+            changes.append("📄 تم حفظ القالب في music_card_template.txt")
+        
+        # إعادة كتابة ملف البوت إذا تغيّر
+        if current_code != bot_file.read_text(encoding='utf-8'):
+            bot_file.write_text(current_code, encoding='utf-8')
+            changes.append("📝 تم حفظ التعديلات في ملف البوت")
+        
+        # إفراغ ملف التعليمات بعد التنفيذ
+        edits_file.write_text("", encoding='utf-8')
+        changes.append("🗑️ تم إفراغ ملف bot_edits.txt")
+        
+        result = "✅ تم تطبيق التعديلات:\n" + "\n".join(changes) if changes else "✅ تم قراءة التعليمات بدون تغييرات."
+        
+        # إعادة تشغيل البوت بعد 3 ثوانٍ
+        try:
+            import threading
+            def restart_after():
+                time.sleep(3)
+                os._exit(42)  # Railway سيعيد التشغيل تلقائيًا
+            threading.Thread(target=restart_after, daemon=True).start()
+            result += "\n\n🔄 البوت سيعيد تشغيل نفسه خلال 3 ثوانٍ..."
+        except Exception:
+            result += "\n\n⚠️ أعد تشغيل البوت يدويًا لتطبيق التعديلات."
+        
+        return result
+    except Exception as exc:
+        log.exception("self-edit failed")
+        return f"❌ فشل تطبيق التعديلات: {exc}"
+
+
 # ----------------------------- الحلقات -----------------------------
+async def broadcast_to_all_users(sender, message):
+    """إرسال رسالة خاصة لكل المستخدمين في كل الغرف (جماعية/برودكاست)."""
+    targets = set()
+    try:
+        for rid in await all_room_ids():
+            try:
+                data, err = await rpc("room_members", {"_room": rid})
+                members = data or []
+                for m in members:
+                    uid = m.get("user_id") or m.get("id")
+                    if uid and uid != BOT_ID and uid != sender:
+                        targets.add(str(uid))
+            except Exception:
+                log.warning("failed to get members of room %s", rid)
+    except Exception as e:
+        log.exception("broadcast_to_all_users failed: %s", e)
+        return f"❌ تعذر جمع المشتركين: {e}"
+
+    if not targets:
+        return "📭 لا يوجد مشتركون في الغرف."
+
+    sent = 0
+    failed = 0
+    for uid in targets:
+        try:
+            await dm_send(uid, message)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.5)  # تأخير بسيط لتجنب الـ rate limit
+
+    return f"✅ تم إرسال الرسالة الجماعية:\n📤 {sent} مستخدم\n❌ {failed} فشل"
+
+
+async def add_new_game(sender, full_text):
+    """أضف لعبة جديدة — يقرأ ملف games_to_add.json ويضيف الألعاب ثم يعيد التشغيل."""
+    games_file = Path(__file__).resolve().parent / "games_to_add.json"
+    if not games_file.exists():
+        return (
+            "📝 لإنشاء ملف games_to_add.json، اكتب فيه:\n"
+            '{"games": [{"name": "اسم_اللعبة", "key": "game_key", "description": "وصف"}]}\n'
+            "ثم اكتب 'أضف لعبة' مرة أخرى."
+        )
+    try:
+        import json
+        data = json.loads(games_file.read_text(encoding='utf-8'))
+        games = data.get("games", [])
+        if not games:
+            return "❌ الملف فارغ. أضف ألعاب في 'games'."
+        count = 0
+        for g in games:
+            key = g.get("key", g.get("name", "")).strip()
+            name = g.get("name", key)
+            desc = g.get("description", "")
+            # إضافة صورة اللعبة
+            img_name = f"game_{key}.jpg"
+            img_path = Path(__file__).resolve().parent / "assets" / img_name
+            if img_path.exists():
+                GAME_IMAGES[key] = game_asset(img_name)
+                count += 1
+                log.info("added game: %s (%s)", name, key)
+            else:
+                # إذا لا توجد صورة، استخدم صورة افتراضية
+                GAME_IMAGES[key] = game_asset("game_luck.jpg")
+                count += 1
+        games_file.unlink()  # حذف الملف بعد التنفيذ
+        # إعادة تشغيل البوت لتفعيل الألعاب
+        await restart_self()
+        return f"✅ تمت إضافة {count} لعبة جديدة. جاري إعادة التشغيل..."
+    except Exception as e:
+        log.exception("add_new_game failed: %s", e)
+        return f"❌ تعذر إضافة الألعاب: {e}"
+
+
+async def restart_self():
+    """إعادة تشغيل البوت بعد 3 ثوانٍ (بعد تعديل الكود)."""
+    async def _restart():
+        await asyncio.sleep(3)
+        import sys
+        log.info("self-restart: restarting bot")
+        os.execl(sys.executable, sys.executable, *sys.argv)
+    asyncio.create_task(_restart())
+
+
+async def update_libraries(sender):
+    """تحديث مكتبات البوت (yt-dlp, Pillow, arabic-reshaper, etc.) وإعادة التشغيل."""
+    libs_to_update = [
+        "yt-dlp", "yt-dlp-ejs", "Pillow", "arabic-reshaper", "python-bidi",
+        "supabase", "aiohttp", "requests", "flask"
+    ]
+    results = []
+    for lib in libs_to_update:
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-m", "pip", "install", "--upgrade", lib, "--quiet"],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0:
+                results.append(f"✅ {lib}")
+            else:
+                results.append(f"⚠️ {lib}: {result.stderr[:80] if result.stderr else 'خطأ غير معروف'}")
+        except Exception as e:
+            results.append(f"❌ {lib}: {str(e)[:80]}")
+
+    reply = "📦 نتيجة تحديث المكاتب:\n" + "\n".join(results)
+    # إعادة تشغيل البوت بعد التحديث
+    await restart_self()
+    return reply + "\n\n🔄 جاري إعادة تشغيل البوت..."
+
+
 async def dm_loop():
     while True:
         try:
@@ -3076,6 +3488,19 @@ async def dm_loop():
                         reply = await delete_old_backups()
                     elif cmd in ("تلغرام", "تلجرام", "telegram_backup") and is_owner:
                         reply = await send_backup_via_telegram(sender)
+                    elif cmd in ("عدل", "edit", "update") and is_owner:
+                        reply = await apply_self_edits(sender)
+                    elif cmd in ("رسالة أغنية", "music_card") and is_owner:
+                        reply = await update_music_card_template(sender, arg)
+                    elif cmd in ("جماعية", "mass", "برودكاست", "broadcast_dm") and is_owner:
+                        if not arg:
+                            reply = "✍️ استخدم: جماعية نص الرسالة (ستُرسل بخاص لكل المشتركين)"
+                        else:
+                            reply = await broadcast_to_all_users(sender, arg)
+                    elif cmd.startswith(("أضف لعبة", "add_game")) and is_owner:
+                        reply = await add_new_game(sender, text)
+                    elif cmd in ("تحديث المكاتب", "تحديث", "update_libs", "upgrade") and is_owner:
+                        reply = await update_libraries(sender)
                     if reply: await dm_send(sender, reply)
                 await run(lambda i=row["id"]: sb.table("dm_relay").delete().eq("id", i).execute())
         except Exception:
@@ -3108,13 +3533,7 @@ async def heartbeat_loop():
         now = time.time()
         for rid in list(rooms):
             await rpc("room_heartbeat", {"_room": rid})
-            game = war_games.get(f"war_{rid}")
-            if game and now >= game.get("expires_at", 0):
-                war_games.pop(f"war_{rid}", None)
-                try:
-                    await room_send(rid, "⌛ انتهت لعبة الحرب تلقائياً بسبب انتهاء المهلة. اكتب «حرب» لبدء لعبة جديدة.")
-                except Exception:
-                    log.exception("failed to announce war timeout for room %s", rid)
+            # الحرب مفتوحة المدة — لا تنتهي تلقائيًا
         # تنظيف طلبات نشر@ القديمة
         for key, info in list(publish_pending.items()):
             created = info.get("at") if isinstance(info, dict) else info
