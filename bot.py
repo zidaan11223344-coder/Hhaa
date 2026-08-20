@@ -280,22 +280,6 @@ music_state = {}     # room_id -> آخر أغنية شغّلها البوت
 music_last_by_user = {}  # user_id -> آخر طلب أغنية، فاصل مستقل دقيقتان لكل مستخدم
 music_tasks = {}      # room_id -> مهمة البحث/التشغيل الخلفية
 publish_pending = {}  # (room_id, user_id) -> وقت طلب نشر@
-PUBLIC_ID_LOCK = asyncio.Lock()  # حماية مولّد الأكواد العامة القصيرة
-
-async def new_public_post_id(posts=None):
-    """إنشاء كود عام من 3 أرقام فقط (100..999).
-
-    الكود لا يستخدم UUID ولا يظهر أي معرّف طويل للمستخدم.
-    نتحقق من المنشورات المحفوظة حتى لا يتكرر الكود مع أغنية/نشر سابق.
-    """
-    async with PUBLIC_ID_LOCK:
-        posts = posts if isinstance(posts, dict) else load_published_posts()
-        used = {str(k) for k in posts.keys()}
-        used.update(str(v.get("post_id")) for v in posts.values() if isinstance(v, dict) and v.get("post_id"))
-        available = [str(n) for n in range(100, 1000) if str(n) not in used]
-        if not available:
-            raise RuntimeError("تم استنفاد أكواد المنشورات الثلاثية (100-999).")
-        return random.choice(available)
 SOCIAL_SEEN = set()
 SOCIAL_WEBHOOK_TOKEN = str(os.environ.get("SOCIAL_WEBHOOK_TOKEN") or C.get("social_webhook_token", "")).strip()
 http: aiohttp.ClientSession = None
@@ -413,7 +397,10 @@ async def is_vip(uid, username):
     return False
 
 async def require_vip(uid, username, feature="هذه الخدمة"):
-    return None
+    if await is_vip(uid, username):
+        return None
+    return (f"🔒 @{username} هذه {feature} تتطلب توثيق VIP من صاحب البوت.\n"
+            f"📌 طريقة التوثيق: صاحب البوت يكتب vip@اسم_المستخدم")
 
 async def grant_vip_by_username(target_username):
     target = str(target_username or '').replace('@', '').strip()
@@ -1641,8 +1628,8 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
 
     # تسجيل الأغنية كمنشور بدون إنشاء صورة للأغنية، حتى تبقى التفاعلات
     # (إعجاب/حب/تعليق) مرتبطة بصاحب الطلب عبر post_id.
+    post_id = str(uuid.uuid4())
     posts = load_published_posts()
-    post_id = await new_public_post_id(posts)
     posts[post_id] = {
         "post_id": post_id, "owner_id": str(requester_id), "owner_name": requester_name,
         "source_room_id": str(rid), "type": "music", "title": title,
@@ -1657,7 +1644,6 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
         f"👤 الطلب بواسطة: @{requester_name}\n"
         f"🏠 الغرفة: {source_room}\n"
         f"🆔 {post_id}\n"
-        f"━━━━━━━━━━━━━━\n"
         f"❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
     )
     targets = await all_room_ids()
@@ -2020,9 +2006,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             source_room = rooms.get(rid, "الغرفة")
             # Re-host the image on the bot's public Railway endpoint when possible.
             public_media_url = await cache_publish_media(media_url) or media_url
+            post_id = str(uuid.uuid4())
             posts = load_published_posts()
-            post_id = await new_public_post_id(posts)
-            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "type": "publication", "media_url": public_media_url, "created_at": now_iso()}
+            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": public_media_url, "created_at": now_iso()}
             save_published_posts(posts)
             published = 0
             for target_rid in await all_room_ids():
@@ -2033,11 +2019,10 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                         f"👤 بواسطة: @{p_name}\n"
                         f"🆔 {post_id}\n"
                         f"🏠 {target_name}\n"
-                        f"━━━━━━━━━━━━━━\n"
-                        f"❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
+                        f"❤️ إعجاب   👎 عدم إعجاب   ↩️ رد"
                     )
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
-                    await room_send(target_rid, f"🆔 {post_id}\n❤️ إعجاب | 👎 عدم إعجاب | 💖 أحببته | 💬 تعليق")
+                    await room_send(target_rid, "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة")
                     published += 1
                 except Exception:
                     log.exception("publish@ failed for room %s", target_rid)
