@@ -68,6 +68,7 @@ MODERATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mode
 WELCOME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.json")
 PUBLISHED_POSTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "published_posts.json")
 SOCIAL_EVENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social_events.json")
+VIP_USERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vip_users.json")
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -368,6 +369,53 @@ def load_published_posts(): return load_json(PUBLISHED_POSTS_PATH, {})
 def save_published_posts(x): save_json(PUBLISHED_POSTS_PATH, x)
 def load_social_events(): return load_json(SOCIAL_EVENTS_PATH, {})
 def save_social_events(x): save_json(SOCIAL_EVENTS_PATH, x)
+
+def load_vip_users():
+    data = load_json(VIP_USERS_PATH, {})
+    if isinstance(data, list):
+        return {str(x).strip().lower(): {"username": str(x).strip()} for x in data if str(x).strip()}
+    return data if isinstance(data, dict) else {}
+
+def save_vip_users(x): save_json(VIP_USERS_PATH, x)
+
+async def is_vip(uid, username):
+    if str(username or '').strip().lower() == OWNER:
+        return True
+    data = load_vip_users()
+    key_uid = str(uid)
+    key_name = str(username or '').strip().lower()
+    if key_uid in data:
+        return True
+    for key, item in data.items():
+        if str(key).lower() == key_name:
+            return True
+        if isinstance(item, dict):
+            if str(item.get("id", "")).strip() == key_uid:
+                return True
+            if str(item.get("username", "")).strip().lower() == key_name:
+                return True
+    return False
+
+async def require_vip(uid, username, feature="هذه الخدمة"):
+    if await is_vip(uid, username):
+        return None
+    return (f"🔒 @{username} هذه {feature} تتطلب توثيق VIP من صاحب البوت.\n"
+            f"📌 طريقة التوثيق: صاحب البوت يكتب vip@اسم_المستخدم")
+
+async def grant_vip_by_username(target_username):
+    target = str(target_username or '').replace('@', '').strip()
+    if not target:
+        return False, "❌ الصيغة: vip@اسم المستخدم"
+    rows, err = await table_select(lambda: sb.table("profiles").select("id,username").eq("username", target).limit(1).execute())
+    if err:
+        return False, f"❌ تعذر البحث عن المستخدم: {err}"
+    if not rows:
+        return False, f"❌ المستخدم @{target} غير موجود."
+    row = rows[0]
+    data = load_vip_users()
+    data[str(row.get("id"))] = {"id": str(row.get("id")), "username": str(row.get("username") or target), "granted_at": now_iso()}
+    save_vip_users(data)
+    return True, f"✅ تم توثيق @{row.get('username') if row.get('username') else target} VIP.\n🎵 يمكنه تشغيل/مشاركة الأغاني.\n🎮 ويمكنه استخدام الألعاب."
 
 def normalize_text(s):
     return re.sub(r"\s+", " ", str(s or "").strip().lower())
@@ -1728,7 +1776,8 @@ HELP_GAMES = """━━━━━━━━ 🎮 أوامر الألعاب ━━�
 🎲 مضاربة رقم — مراهنة
 🎲 حظ / نرد / تعدين / زواج
 ━━━━━━━━━━━━━━━━━━━━
-كل لعبة ترسل صورة اللعبة مع النتيجة والنقاط.
+كل لعبة ترسل الصورة ثم تفاصيلها كنص فقط.
+🔒 الألعاب تحتاج توثيق VIP من صاحب البوت عبر vip@اسم_المستخدم.
 """
 
 HELP_ROOM = """━━━━━━━━ 🤖 جميع أوامر البوت ━━━━━━━━
@@ -1740,6 +1789,7 @@ p@الاسم — البروفايل
 st@الاسم — حالة المستخدم
 
 [2] الموسيقى
+🔒 تشغيل/مشاركة الأغاني تحتاج توثيق VIP من صاحب البوت.
 تشغيل اسم الأغنية — YouTube
 تيك اسم الأغنية — TikTok
 .تشغيل اسم الأغنية — Spotify (يبحث عن النسخة الصوتية)
@@ -1764,6 +1814,7 @@ b@الاسم — حظر
 ip@الاسم — حظر IP
 
 [5] الهدايا
+🔐 توثيق VIP: vip@اسم_المستخدم (صاحب البوت فقط)
 gv — عرض الهدايا
 gv@رقم_الهدية@اسم_الحساب — إرسال هدية
 
@@ -1861,7 +1912,7 @@ async def send_game_card(rid, game_key, title, lines, fallback_text=None):
             # التفاصيل بعد الصورة مباشرة، كنص قابل للقراءة والنسخ.
             details = "\n".join(lines)
             if details:
-                await room_send(rid, f"{title}\n{details}\n❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق")
+                await room_send(rid, f"{title}\n{details}")
             return
         except Exception as exc:
             log.warning("game card upload failed: %s", exc)
@@ -1886,11 +1937,15 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     if text.startswith("نشر ") or text.startswith("broadcast "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        vip_error = await require_vip(uid, p_name, "نظام النشر")
+        if vip_error: return vip_error
         msg = text.split(maxsplit=1)[1].strip()
         await broadcast_text("📢 " + msg)
         return "✅ تم نشر الرسالة في كل الغرف."
     if text.startswith("نشرصورة ") or text.startswith("broadcast_image "):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        vip_error = await require_vip(uid, p_name, "نظام النشر")
+        if vip_error: return vip_error
         url = text.split(maxsplit=1)[1].strip()
         await broadcast_media("📢", url, m_type="image")
         return "✅ تم نشر الصورة في كل الغرف."
@@ -1900,6 +1955,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if text.strip() in ("نشر@", "publish@"):
         if not await is_master(uid, p_name):
             return "🚫 للماستر فقط."
+        vip_error = await require_vip(uid, p_name, "نظام النشر")
+        if vip_error: return vip_error
         publish_pending[publish_key] = time.time()
         return "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع اسم الغرفة وخيارات: ❤️ إعجاب | 👎 مااعجاب | ↩️ رد."
 
@@ -1976,6 +2033,40 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if text == "المسترات":
         masters = load_masters()
         return "👑 قائمة الماسترز:\n" + "\n".join([f"• @{m}" for m in masters]) if masters else "👤 المالك فقط هو الماستر حالياً."
+
+    # توثيق VIP للأغاني والألعاب: المالك فقط يملك أمر vip@.
+    if lower_text.startswith("vip@"): 
+        if str(p_name).strip().lower() != OWNER:
+            return "🚫 توثيق VIP متاح لصاحب البوت فقط."
+        target = text.split("@", 1)[1].strip()
+        ok, msg = await grant_vip_by_username(target)
+        return msg
+
+    if lower_text.startswith("unvip@"): 
+        if str(p_name).strip().lower() != OWNER:
+            return "🚫 إزالة توثيق VIP متاحة لصاحب البوت فقط."
+        target = text.split("@", 1)[1].strip().lower().lstrip("@")
+        data = load_vip_users()
+        removed = []
+        for key, item in list(data.items()):
+            name = item.get("username", "") if isinstance(item, dict) else str(item)
+            if key.lower() == target or str(name).lower() == target:
+                removed.append(name or key)
+                data.pop(key, None)
+        save_vip_users(data)
+        return (f"✅ تم إلغاء توثيق @{removed[0] if removed else target}." if removed else f"⚠️ @{target} غير موثّق VIP.")
+
+    if lower_text in ("vips", "vip", "الموثقين"):
+        if str(p_name).strip().lower() != OWNER:
+            return "🚫 قائمة VIP لصاحب البوت فقط."
+        data = load_vip_users()
+        names = []
+        for item in data.values():
+            if isinstance(item, dict):
+                names.append(str(item.get("username") or item.get("id") or ""))
+            else:
+                names.append(str(item))
+        return "👑 موثقو VIP:\n" + ("\n".join(f"• @{n}" for n in names if n) if names else "لا يوجد موثقون.")
 
     if text.startswith("mas@"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
@@ -2064,7 +2155,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     cmd, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
 
     GAME_COMMANDS = {"عمل","job","كف","slap","مضاربة","bet","حرب","war","سرقة","rob","قتال","fight",
-                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين"}
+                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين","زواج","marriage"}
 
     async def require_game_cooldown(game_command):
         ok_cd, rem_cd = check_cooldown(uid, p_name, f"game:{game_command}", int(C.get("game_cooldown_seconds", 30)))
@@ -2080,7 +2171,15 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         music_last_by_user[str(uid)] = now
         return None
 
+    # كل أوامر الألعاب محمية بتوثيق VIP من صاحب البوت.
+    if cmd in GAME_COMMANDS:
+        vip_error = await require_vip(uid, p_name, "أوامر الألعاب")
+        if vip_error:
+            return vip_error
+
     if cmd in ("تشغيل", "play", "شغل"):
+        vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
+        if vip_error: return vip_error
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
@@ -2088,12 +2187,16 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 @{p_name} جاري تنفيذ طلبك…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("مشاركة", "share"):
+        vip_error = await require_vip(uid, p_name, "مشاركة الأغاني")
+        if vip_error: return vip_error
         current = music_state.get(rid)
         if not current:
             return "❌ لا توجد أغنية حالياً للمشاركة."
         return f"🎵 مشاركة الأغنية\n🎶 {current.get('title','المقطع')} — {current.get('artist','')}\n🔗 {current.get('spotify_url') or current.get('youtube_url') or ''}"
 
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
+        vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
+        if vip_error: return vip_error
         if not arg:
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
         cd = await require_music_cooldown()
@@ -2102,6 +2205,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return f"🎵 @{p_name} جاري تنفيذ طلبك من Spotify…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
+        vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
+        if vip_error: return vip_error
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
