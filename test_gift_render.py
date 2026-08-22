@@ -1,15 +1,15 @@
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-base = Path(__file__).resolve().parent
-template = base / 'assets' / 'gift_template_rose.webp'
+base = Path('/home/ubuntu/ready_bot')
+template = base / 'assets/gift_template_rose.webp'
 out = base / 'generated_gifts' / 'test_from_to.png'
-out.parent.mkdir(parents=True, exist_ok=True)
+out.parent.mkdir(exist_ok=True)
 image = Image.open(template).convert('RGBA')
 draw = ImageDraw.Draw(image)
-font_path = base / 'assets' / 'Amiri-Bold.ttf'
-font = ImageFont.truetype(str(font_path), 28)
-for label, name, y in [('FROM:', 'alsfer', int(image.height*0.78)), ('TO:', 'Crocodile', int(image.height*0.88))]:
+font_path = '/usr/share/fonts/opentype/fonts-hosny-amiri/Amiri-Bold.ttf'
+font = ImageFont.truetype(font_path, 28)
+for label, name, y in [('FROM:', 'alsfer', 624), ('TO:', 'Crocodile', 704)]:
     text = f'{label} @{name}'
     box = draw.textbbox((0, 0), text, font=font)
     x = (image.width - (box[2] - box[0])) // 2
